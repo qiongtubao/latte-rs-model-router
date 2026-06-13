@@ -118,7 +118,7 @@ pub enum StreamEvent {
 
 // ─── serialization helpers for OpenAI API ──────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct OpenAiChatRequest {
     pub model: String,
     pub messages: Vec<OpenAiMessage>,
@@ -145,7 +145,7 @@ pub(crate) struct OpenAiChatRequest {
     pub stream: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct OpenAiMessage {
     pub role: String,
     pub content: String,

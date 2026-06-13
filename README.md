@@ -15,35 +15,165 @@ latte-rs-model-router/
 │   ├── sweeper.rs     # 参数扫描组合
 │   ├── prompts.rs     # 编程测试 prompt 集
 │   └── report.rs      # 结果格式化输出
-├── models.toml        # 示例模型配置文件
+├── models.yaml        # 示例模型配置文件 (YAML)
+├── models.toml        # 示例模型配置文件 (TOML, 兼容旧版)
 └── README.md
+```
+
+---
+
+## 编译与安装 (Build & Install)
+
+### 前置条件
+
+- Rust 工具链 (1.80+): [rustup.rs](https://rustup.rs)
+- Cargo (随 Rust 安装)
+
+### 编译
+
+```bash
+# Debug 构建（开发调试用）
+cargo build
+
+# Release 构建（推荐日常使用，性能好很多）
+cargo build --release
+```
+
+编译产物：
+- `target/debug/latte-tune` — debug 版 CLI
+- `target/release/latte-tune` — release 版 CLI
+- `target/debug/liblatte_ai.rlib` / `target/release/liblatte_ai.rlib` — 库文件
+
+### 安装到系统
+
+```bash
+# 安装 latte-tune CLI 到 ~/.cargo/bin/
+cargo install --path latte-tune
+
+# 之后可以直接运行
+latte-tune --help
+```
+
+### 快速验证
+
+```bash
+# 查看帮助
+cargo run -- --help
+cargo run -- sweep --help
+cargo run -- compare --help
+
+# 列出所有测试 prompt（不需要 API key）
+cargo run -- list-prompts
 ```
 
 ---
 
 ## 1. 模型配置 (Model Configuration)
 
-在 `models.toml` 或代码中配置模型，每个模型需要以下字段：
+模型配置文件使用 **YAML** 格式（推荐），同时向后兼容 **TOML** 格式。
+自动检测文件扩展名：`.yaml` / `.yml` → YAML，`.toml` → TOML。
 
-### 必填字段
+### 1.1 配置文件结构
 
-| 字段 | 类型 | 说明 | 示例 |
-|------|------|------|------|
-| `id` | string | 模型标识符，对应 API 的 model 参数 | `"claude-sonnet-4-20250514"` |
-| `api` | string | API 类型：`"openai"` 或 `"anthropic"` | `"openai"` |
-| `base_url` | string | API 端点地址 | `"https://api.deepseek.com"` |
-| `api_key` | string | API 密钥，支持 `${ENV_VAR}` 环境变量 | `"${OPENAI_API_KEY}"` |
+```yaml
+# models.yaml
+models:
+  - id: "deepseek-chat"
+    api: "openai"
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"
 
-### 可选字段
+  - id: "claude-sonnet-4-20250514"
+    api: "anthropic"
+    base_url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY}"
+```
 
-| 字段 | 默认值 | 说明 |
-|------|--------|------|
-| `name` | 同 `id` | 人类可读的名称 |
-| `provider` | `"custom"` | 提供商名称（deepseek, anthropic, openai 等） |
-| `context_window` | 65536 | 模型上下文窗口大小（token） |
-| `max_tokens` | 4096 | 最大输出 token 数 |
+顶层为 `models` 数组，每个元素定义一个模型。
 
-### 示例
+### 1.2 字段参考
+
+#### 必填字段
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | `string` | 模型标识符，对应 API 的 `model` 参数。例: `"deepseek-chat"`, `"claude-sonnet-4-20250514"` |
+| `api` | `string` | API 协议类型。`"openai"` — OpenAI Chat Completions 兼容 API（支持 DeepSeek、Ollama、Groq 等）；`"anthropic"` — Anthropic Messages API |
+| `base_url` | `string` | API 端点地址。支持 `${ENV_VAR}` 环境变量展开。例: `"https://api.deepseek.com"`, `"${CUSTOM_BASE_URL}"` |
+| `api_key` | `string` | API 认证密钥。支持 `${ENV_VAR}` 展开。例: `"${DEEPSEEK_API_KEY}"`。设为 `"ollama"` 等占位值可跳过认证（本地部署） |
+
+#### 基本信息
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `name` | `string` | 同 `id` | 人类可读的模型名称，用于报告和日志显示。例: `"DeepSeek Chat V3"` |
+| `description` | `string` | — | 模型描述说明，仅作文档用。例: `"通用对话模型，性价比极高"` |
+| `provider` | `string` | `"custom"` | 提供商标识。用于分组和筛选。例: `"deepseek"`, `"anthropic"`, `"openai"`, `"ollama"` |
+
+#### 容量参数
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `context_window` | `u32` | `65536` (64K) | 模型上下文窗口大小（token 数）。实际使用由模型决定。例: Claude `200000`, GPT-4o `128000`, DeepSeek `65536` |
+| `max_tokens` | `u32` | `4096` | 单次请求最大输出 token 数。请求中 `max_tokens` 参数的上限。例: `8192`, `16384` |
+
+#### 推理能力
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `reasoning` | `bool` | `true` (anthropic API) / `false` (openai API) | 模型是否支持思考/推理（thinking/reasoning）。设为 `true` 后，`ThinkingBudget` 参数生效。Anthropic 原生支持；OpenAI 兼容 API 中，`reasoning_effort` 参数仅部分模型支持（如 DeepSeek R1、o1 系列） |
+
+#### 成本（USD / 百万 token）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `cost_per_million_input` | `f64` | `0.0` | 每百万输入 token 成本（美元）。用于费用估算和对比。例: DeepSeek `0.27`, GPT-4o `2.50`, Claude Opus `15.0` |
+| `cost_per_million_output` | `f64` | `0.0` | 每百万输出 token 成本（美元）。注意输出通常比输入贵 3~5 倍。例: DeepSeek `1.10`, GPT-4o `10.0`, Claude Opus `75.0` |
+
+### 1.3 完整示例
+
+```yaml
+models:
+  - id: "deepseek-chat"
+    name: "DeepSeek Chat V3"
+    description: "通用对话模型，性价比极高"
+    api: "openai"
+    provider: "deepseek"
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"
+    context_window: 65536
+    max_tokens: 8192
+    reasoning: false
+    cost_per_million_input: 0.27
+    cost_per_million_output: 1.10
+
+  - id: "claude-sonnet-4-20250514"
+    name: "Claude Sonnet 4"
+    description: "Anthropic 中端模型，适合代码生成与日常对话"
+    api: "anthropic"
+    provider: "anthropic"
+    base_url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY}"
+    context_window: 200000
+    max_tokens: 8192
+    reasoning: true
+    cost_per_million_input: 3.0
+    cost_per_million_output: 15.0
+
+  # 本地 Ollama 模型
+  - id: "qwen2.5-coder-32b-instruct"
+    name: "Qwen 2.5 Coder 32B"
+    api: "openai"
+    provider: "ollama"
+    base_url: "http://localhost:11434"
+    api_key: "ollama"
+    context_window: 32768
+    max_tokens: 4096
+```
+
+完整配置示例见仓库根目录的 `models.yaml`。
+
+### 1.4 TOML 格式 (向后兼容)
 
 ```toml
 [[models]]
@@ -55,29 +185,58 @@ base_url = "https://api.deepseek.com"
 api_key = "${DEEPSEEK_API_KEY}"
 context_window = 65536
 max_tokens = 8192
-
-[[models]]
-id = "claude-sonnet-4-20250514"
-name = "Claude Sonnet 4"
-api = "anthropic"
-provider = "anthropic"
-base_url = "https://api.anthropic.com"
-api_key = "${ANTHROPIC_API_KEY}"
-context_window = 200000
-max_tokens = 8192
 ```
 
-### 已知提供商配置参考
+字段与 YAML 完全相同，`[[models]]` 对应 YAML 的 `models:` 数组。
 
-| 提供商 | API 类型 | base_url | 默认模型 |
-|--------|----------|----------|----------|
-| OpenAI | `openai` | `https://api.openai.com` | gpt-4o |
-| Anthropic | `anthropic` | `https://api.anthropic.com` | claude-sonnet-4-20250514 |
-| DeepSeek | `openai` | `https://api.deepseek.com` | deepseek-chat |
-| Ollama (本地) | `openai` | `http://localhost:11434` | qwen2.5-coder:32b |
-| Google (Gemini) | `openai` | `https://generativelanguage.googleapis.com/v1beta/openai/` | gemini-2.5-pro |
-| Groq | `openai` | `https://api.groq.com/openai` | llama-3.3-70b |
-| OpenRouter | `openai` | `https://openrouter.ai/api/v1` | 任意 |
+### 1.5 已知提供商配置参考
+
+| 提供商 | api | base_url | 默认模型 | reasoning |
+|--------|-----|----------|----------|-----------|
+| OpenAI | `openai` | `https://api.openai.com` | gpt-4o | 部分模型 |
+| Anthropic | `anthropic` | `https://api.anthropic.com` | claude-sonnet-4-20250514 | ✅ |
+| DeepSeek | `openai` | `https://api.deepseek.com` | deepseek-chat | R1 系列 |
+| Ollama (本地) | `openai` | `http://localhost:11434` | 取决于部署 | ❌ |
+| Google (Gemini) | `openai` | `https://generativelanguage.googleapis.com/v1beta/openai/` | gemini-2.5-pro | ❌ |
+| Groq | `openai` | `https://api.groq.com/openai` | llama-3.3-70b | ❌ |
+| OpenRouter | `openai` | `https://openrouter.ai/api/v1` | 任意 | 取决于路由模型 |
+### 1.6 配置文件自动发现
+
+`latte-tune` 在不指定 `--config` 时，按以下优先级自动查找配置文件：
+
+| 优先级 | 路径 | 格式 | 说明 |
+|--------|------|------|------|
+| 1 | `./latte.yaml` / `./latte.yml` / `./latte.json` | YAML/JSON | 项目本地配置（推荐） |
+| 2 | `./models.yaml` / `./models.yml` / `./models.json` | YAML/JSON | 项目本地配置 |
+| 3 | `./latte.toml` / `./models.toml` | TOML | 项目本地配置（兼容旧版） |
+| 4 | `~/.latte/models.yaml` / `~/.latte/models.json` | YAML/JSON | 用户全局配置（dot-dir，推荐） |
+| 5 | `~/.config/latte/models.yaml` / `~/.config/latte/models.json` | YAML/JSON | 用户全局配置（XDG 标准） |
+| 6 | `~/.latte/models.toml` / `~/.config/latte/models.toml` | TOML | 用户全局配置（兼容旧版） |
+
+找到第一个存在的文件即停止。都找不到时才使用命令行参数指定的单个模型。
+
+**全局配置** — 推荐放到 `~/.latte/models.yaml`（简洁）或 `~/.config/latte/models.yaml`（XDG 标准）：
+
+```bash
+mkdir -p ~/.latte
+cp models.yaml ~/.latte/models.yaml
+# 编辑填入 API key 后，在任何目录直接运行
+latte-tune sweep --quick
+```
+
+也支持 JSON 格式：`~/.latte/models.json`。
+
+**项目配置** — 项目根目录创建 `latte.yaml`，团队成员共用（密钥用环境变量保护）：
+
+```yaml
+# latte.yaml
+models:
+  - id: "deepseek-chat"
+    api: "openai"
+    provider: "deepseek"
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"   # 每人设自己的环境变量
+```
 
 ---
 
@@ -297,44 +456,176 @@ GenerateParams {
 
 ---
 
-## 4. 使用 latte-tune 调优
+## 4. CLI 使用指南
 
-`latte-tune` 可以自动遍历参数组合，让你直观对比不同参数下的输出质量。
+`latte-tune` 是参数调优 CLI 工具，支持三个子命令。
 
-### 基本用法
+### 4.1 命令概览
+
+```
+latte-tune <COMMAND>
+
+Commands:
+  chat          与模型对话（一键直连）
+  sweep         对模型运行参数扫描
+  compare       对单个 prompt 对比所有参数组合
+  list-prompts  列出所有测试 prompt
+  help          查看帮助
+```
+
+### 4.2 chat — 一键对话 & 交互 REPL
+
+默认进入交互式 REPL（循环对话），也可以单次发送。
+
+**交互模式**（直接运行，维护对话历史）：
 
 ```bash
-# 先看有哪些测试 prompt
-./target/release/latte-tune list-prompts
+latte-tune chat
+# 进入 REPL，可多轮对话：
+#   ▶ 用 Rust 写一个二分查找
+#   ◀ (AI 回复...)
+#   ▶ 给这个函数加上单元测试
+#   ◀ (AI 回复...)
+#   ▶ /clear   清空历史
+#   ▶ /model deepseek  切换模型
+#   ▶ /exit    退出
+```
 
-# 快速扫一遍（4种参数组合 x 8个prompt）
-LATTE_API_KEY="sk-..." ./target/release/latte-tune sweep deepseek-chat \
+**单次模式**：
+
+```bash
+# 命令行传 prompt
+latte-tune chat "用 Rust 写一个二分查找"
+
+# 选模型
+latte-tune chat -m claude "解释 Rust 所有权"
+
+# 管道输入
+cat src/main.rs | latte-tune chat "Review this code:"
+
+# 显式进入 REPL（即使有 stdin）
+latte-tune chat -r
+```
+
+> 运行 `latte-tune chat --help` 查看完整参数。
+
+REPL 内建命令：
+| 命令 | 作用 |
+|------|------|
+| `/exit` `/quit` `/q` | 退出 |
+| `/clear` `/c` | 清空对话历史 |
+| `/model <id>` | 切换模型 |
+| `/help` `/h` | 帮助 |
+
+### 4.3 环境变量
+
+
+| 变量 | 用途 | 必填 |
+|------|------|------|
+| `LATTE_API_KEY` | CLI 直接指定模型时的默认 API key | 否（也可用 `--api-key`） |
+| `ANTHROPIC_API_KEY` | Anthropic 模型 API key（配置文件 `${ANTHROPIC_API_KEY}` 展开） | 按需 |
+| `DEEPSEEK_API_KEY` | DeepSeek 模型 API key（配置文件 `${DEEPSEEK_API_KEY}` 展开） | 按需 |
+| `OPENAI_API_KEY` | OpenAI 模型 API key（配置文件 `${OPENAI_API_KEY}` 展开） | 按需 |
+| `RUST_LOG` | 日志级别: `error`, `warn`, `info`, `debug`, `trace`（默认 `error`） | 否 |
+
+### 4.4 sweep — 参数扫描
+
+对模型运行多组参数组合，每组参数在所有测试 prompt 上执行，输出对比结果。
+
+```bash
+# 完整命令签名
+latte-tune sweep [OPTIONS] [MODEL]
+
+# 参数说明
+#   [MODEL]               模型 ID（可选，使用 --config 或全局配置时不需要）
+#   --api <API>           API 类型: openai 或 anthropic [default: openai]
+#   --base-url <URL>      自定义 API 端点
+#   --api-key <KEY>       API key（也可设 LATTE_API_KEY 环境变量）
+#   --provider <NAME>     提供商名称 [default: custom]
+#   --max-tokens <N>      最大输出 token 数 [default: 4096]
+#   --context-window <N>  上下文窗口大小 [default: 65536]
+#   --quick               快速扫描（4 种组合，代替默认的 10 种）
+#   --prompt-filter <S>   只运行名称包含 S 的 prompt
+#   --sweep-filter <S>    只运行标签包含 S 的参数组合
+#   --config <PATH>       从配置文件加载模型 (YAML / JSON / TOML，此时 MODEL 参数被忽略)
+```
+
+#### 使用模式
+
+**模式一：命令行直接指定模型**
+
+```bash
+# 快速扫描 DeepSeek
+LATTE_API_KEY="sk-..." latte-tune sweep deepseek-chat \
   --api openai \
   --base-url https://api.deepseek.com \
   --quick
 
-# 完整扫描（10种参数组合）
-ANTHROPIC_API_KEY="sk-..." ./target/release/latte-tune sweep claude-sonnet-4-20250514 \
+# 完整扫描 Claude
+ANTHROPIC_API_KEY="sk-..." latte-tune sweep claude-sonnet-4-20250514 \
   --api anthropic \
   --base-url https://api.anthropic.com
-
-# 用配置文件扫描多个模型
-ANTHROPIC_API_KEY="sk-..." DEEPSEEK_API_KEY="sk-..." \
-  ./target/release/latte-tune sweep --config models.toml --quick
-
-# 只测特定 prompt
-./target/release/latte-tune sweep deepseek-chat --prompt-filter "rust-parse"
-
-# 只测特定 sweep
-./target/release/latte-tune sweep deepseek-chat --sweep-filter "conservative"
-
-# 对比单个 prompt 在所有参数下的输出
-./target/release/latte-tune compare deepseek-chat --prompt rust-parse-json
 ```
 
-### 扫描参数组合
+**模式二：从配置文件加载模型**
+```bash
+# 一次性扫描 models.yaml 中所有模型
+ANTHROPIC_API_KEY="sk-..." DEEPSEEK_API_KEY="sk-..." \
+  latte-tune sweep --config models.yaml --quick
+```
 
-**快速扫描** (4 种):
+当使用 `--config` 时，配置文件中每个 `[[models]]` 条目都会被依次测试。
+
+**过滤**
+
+```bash
+# 只测特定 prompt
+latte-tune sweep deepseek-chat --prompt-filter "rust-parse"
+
+# 只测特定参数组合
+latte-tune sweep deepseek-chat --sweep-filter "thinking"
+
+# 组合使用
+latte-tune sweep deepseek-chat --prompt-filter "debug" --sweep-filter "low-temp" --quick
+```
+
+### 4.5 list-prompts — 列出测试 prompt
+
+不需要 API key，纯本地操作。
+
+```bash
+latte-tune list-prompts
+```
+
+输出示例：
+```
+Available test prompts:
+  rust-parse-json  [code-gen]
+    Checks code structure, error handling, and idiomatic Rust
+  debug-memory-leak  [debug]
+    Checks ability to identify memory issues and propose fixes
+  ...
+Total: 8 prompts
+```
+
+Prompt 分类：`code-gen`、`debug`、`refactor`、`explain`、`architecture`。
+
+### 4.6 compare — 单 prompt 对比
+
+对**一个** prompt 运行所有参数组合，并列显示各组合的输出，方便横向对比。
+
+```bash
+latte-tune compare [OPTIONS] --prompt <PROMPT> <MODEL>
+
+# 示例
+latte-tune compare deepseek-chat --prompt rust-parse-json
+```
+
+与 `sweep` 的区别：`sweep` 跑所有 prompt × 所有参数组合；`compare` 跑一个 prompt × 所有参数组合，输出更适合 A/B 对比。
+
+### 4.7 扫描参数组合详情
+
+**快速扫描** (4 种，`--quick`):
 
 | 标签 | temperature | topP | minP | thinking |
 |------|------------|------|------|----------|
@@ -343,12 +634,25 @@ ANTHROPIC_API_KEY="sk-..." DEEPSEEK_API_KEY="sk-..." \
 | balanced | 0.3 | 0.9 | - | - |
 | thinking | 0.1 | - | - | Medium |
 
-**完整扫描** (10 种): 包含 conservative, low-temp, balanced, creative, no-minp, anti-repetition, thinking-medium, thinking-high, short-output, very-creative。
+**完整扫描** (10 种，默认):
 
-### 如何判断 "最优"
+| 标签 | temperature | topP | minP | topK | thinking | 其他 |
+|------|------------|------|------|------|----------|------|
+| conservative | 0.0 | 0.9 | - | - | - | - |
+| low-temp | 0.1 | 0.92 | 0.03 | - | - | - |
+| balanced | 0.3 | 0.9 | - | - | - | - |
+| creative | 0.7 | 0.95 | - | - | - | presence_penalty=0.1 |
+| no-minp | 0.3 | 0.9 | - | - | - | - |
+| anti-repetition | 0.3 | 0.9 | - | - | - | frequency_penalty=0.3 |
+| thinking-medium | 0.1 | - | - | - | Medium | - |
+| thinking-high | 0.2 | - | - | - | High | - |
+| short-output | 0.3 | 0.9 | - | - | - | max_tokens=512 |
+| very-creative | 0.9 | 0.99 | - | 80 | - | - |
+
+### 4.8 结果解读
 
 1. **看输出质量**: 代码是否完整？语法正确？风格一致？
-2. **看 token 用量**: 相同质量下 token 越少越好
+2. **看 token 用量**: 相同质量下 token 越少越好（`↑N ↓M`：N 是输入 token，M 是输出 token）
 3. **看响应速度**: 延迟是否可接受？
 4. **看一致性**: 重复跑几次，输出是否稳定？
 
@@ -358,11 +662,26 @@ ANTHROPIC_API_KEY="sk-..." DEEPSEEK_API_KEY="sk-..." \
 
 ## 5. 代码中使用
 
+`latte-ai` 提供了完整的 Rust API。所有示例位于 `latte-ai/examples/`，可直接运行：
+
+```bash
+# 基础对话
+DEEPSEEK_API_KEY="sk-..." cargo run --example basic
+
+# 流式对话
+DEEPSEEK_API_KEY="sk-..." cargo run --example streaming
+# 从配置文件加载模型
+DEEPSEEK_API_KEY="sk-..." cargo run --example config_file -- models.yaml
+```
+
+### 5.1 基本用法
+
 ```rust
 use latte_ai::prelude::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ── 构建模型 ──────────────────────────────────────
     let model = Model {
         id: "deepseek-chat".into(),
         name: "DeepSeek Chat".into(),
@@ -379,26 +698,143 @@ async fn main() -> Result<()> {
 
     let client = AiClient::new(model)?;
 
-    // 使用推荐参数
+    // ── 三种传参方式 ──────────────────────────────────
+
+    // 1. 便捷预设
+    let params = GenerateParams::code_defaults();
+
+    // 2. 手动指定
     let params = GenerateParams {
         temperature: Some(0.1),
         top_p: Some(0.9),
         min_p: Some(0.05),
+        max_tokens: Some(4096),
         ..Default::default()
     };
 
-    let completion = client.chat(&[
-        Message {
-            role: Role::User,
-            content: "Write a Rust function to sum a Vec".into(),
-        },
-    ], &params).await?;
+    // 3. 使用默认值（全部 None，由模型提供商决定）
+    let params = GenerateParams::default();
 
+    // ── 发送请求 ──────────────────────────────────────
+
+    // 简单对话
+    let completion = client.chat(&[
+        Message { role: Role::User, content: "用 Rust 写一个求和函数".into() },
+    ], &params).await?;
     println!("{}", completion.content);
-    println!("Usage: {} input, {} output tokens",
-        completion.usage.input_tokens,
-        completion.usage.output_tokens);
+    println!("用量: {}", completion.usage);
+
+    // 带系统提示的多轮对话
+    let completion = client.chat(&[
+        Message { role: Role::System, content: "你是 Rust 专家，代码简洁，用英文命名。".into() },
+        Message { role: Role::User, content: "写一个二分查找".into() },
+    ], &params).await?;
 
     Ok(())
 }
+```
+
+### 5.2 流式输出
+
+```rust
+use latte_ai::prelude::*;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let client = AiClient::new(model)?;
+
+    let mut stream = client.chat_stream(
+        &[Message { role: Role::User, content: "讲解 Rust 所有权".into() }],
+        &GenerateParams::default(),
+    ).await?;
+
+    while let Some(event) = stream.recv().await {
+        match event {
+            StreamEvent::Delta { content, .. } => print!("{}", content),
+            StreamEvent::Done { usage, .. } => println!("\n用量: {}", usage),
+            StreamEvent::Error(e) => eprintln!("错误: {}", e),
+        }
+    }
+
+    Ok(())
+}
+```
+
+### 5.3 从配置文件加载模型
+
+YAML 或 TOML 配置文件可以在代码中加载，自动按扩展名检测格式：
+
+```rust
+use std::path::Path;
+use latte_ai::prelude::*;
+
+fn load_models(path: &str) -> anyhow::Result<Vec<Model>> {
+    let content = std::fs::read_to_string(path)?;
+    let ext = Path::new(path).extension().and_then(|e| e.to_str());
+
+    #[derive(serde::Deserialize)]
+    struct Config { models: Vec<ModelEntry> }
+
+    #[derive(serde::Deserialize)]
+    struct ModelEntry {
+        id: String,
+        api: String,
+        base_url: String,
+        name: Option<String>,
+        provider: Option<String>,
+        api_key: Option<String>,
+        context_window: Option<u32>,
+        max_tokens: Option<u32>,
+        reasoning: Option<bool>,
+        cost_per_million_input: Option<f64>,
+        cost_per_million_output: Option<f64>,
+    }
+
+    // 按扩展名自动检测格式
+    let cfg: Config = match ext {
+        Some("yaml" | "yml") => serde_yaml::from_str(&content)?,
+        _ => toml::from_str(&content)?,
+    };
+
+    Ok(cfg.models.iter().map(|e| {
+        let api = match e.api.as_str() {
+            "anthropic" | "anthropic-messages" => ApiType::AnthropicMessages,
+            _ => ApiType::OpenAiCompletions,
+        };
+        Model {
+            id: e.id.clone(),
+            name: e.name.clone().unwrap_or_else(|| e.id.clone()),
+            api,
+            provider: e.provider.clone().unwrap_or_else(|| "custom".into()),
+            base_url: e.base_url.clone(),
+            api_key: resolve_env(&e.api_key.clone().unwrap_or_default()),
+            context_window: e.context_window.unwrap_or(65536),
+            max_tokens: e.max_tokens.unwrap_or(4096),
+            supports_thinking: e.reasoning.unwrap_or(false)
+                || matches!(api, ApiType::AnthropicMessages),
+            cost_per_million_input: e.cost_per_million_input.unwrap_or(0.0),
+            cost_per_million_output: e.cost_per_million_output.unwrap_or(0.0),
+        }
+    }).collect())
+}
+
+fn resolve_env(value: &str) -> String {
+    if value.starts_with("${") && value.ends_with('}') {
+        let var = &value[2..value.len() - 1];
+        std::env::var(var).unwrap_or_default()
+    } else {
+        value.to_string()
+    }
+}
+```
+
+完整示例见 `latte-ai/examples/config_file.rs`。
+
+### 5.4 可用预设参数
+
+```rust
+GenerateParams::code_defaults()      // 代码生成: t=0.1, p=0.9, k=40, mp=0.05, mt=4096
+GenerateParams::analysis_defaults()  // 分析/Debug: t=0.2, p=0.9, mp=0.02, mt=8192, thinking=Medium
+GenerateParams::creative_defaults()  // 创意写作: t=0.8, p=0.95, pp=0.1, fp=0.1, mt=4096
+GenerateParams::default()            // 全部 None，使用模型提供商默认值
 ```

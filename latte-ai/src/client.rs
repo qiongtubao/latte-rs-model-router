@@ -130,69 +130,154 @@ impl AiClient {
         let api_key = self.model.api_key.clone();
 
         tokio::spawn(async move {
-            let es = match client
+            // Send streaming request
+            let resp = match client
                 .post(&url)
                 .header("Authorization", format!("Bearer {api_key}"))
                 .json(&req)
-                .eventsource()
+                .send()
+                .await
             {
-                Ok(es) => es,
+                Ok(r) => r,
                 Err(e) => {
-                    tx.send(StreamEvent::Error(format!("Failed to open stream: {e}"))).await.ok();
+                    tx.send(StreamEvent::Error(format!("Request failed: {e}"))).await.ok();
                     return;
                 }
             };
 
-            let mut full_text = String::new();
-            let mut usage = TokenUsage::default();
-
-            let mut es = es;
-            while let Some(event) = es.next().await {
-                match event {
-                    Ok(Event::Open) => continue,
-                    Ok(Event::Message(msg)) => {
-                        if msg.data == "[DONE]" {
-                            break;
-                        }
-                        match serde_json::from_str::<OpenAiStreamChunk>(&msg.data) {
-                            Ok(chunk) => {
-                                if let Some(choice) = chunk.choices.into_iter().next() {
-                                    if let Some(delta) = choice.delta.content {
-                                        full_text.push_str(&delta);
-                                        tx.send(StreamEvent::Delta {
-                                            content: delta,
-                                            usage: None,
-                                        }).await.ok();
-                                    }
-                                    if choice.finish_reason.is_some() {
-                                        if let Some(u) = &chunk.usage {
-                                            usage = TokenUsage {
-                                                input_tokens: u.prompt_tokens,
-                                                output_tokens: u.completion_tokens,
-                                                thinking_tokens: 0,
-                                            };
-                                        }
-                                    }
-                                }
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                // Fall back to non-streaming
+                let mut ns = req.clone();
+                ns.stream = false;
+                match client
+                    .post(&url)
+                    .header("Authorization", format!("Bearer {api_key}"))
+                    .json(&ns)
+                    .send()
+                    .await
+                {
+                    Ok(r) if r.status().is_success() => {
+                        match r.json::<OpenAiChatResponse>().await {
+                            Ok(data) => {
+                                let content = data.choices.into_iter().next()
+                                    .map(|c| c.message.content.unwrap_or_default())
+                                    .unwrap_or_default();
+                                let usage = data.usage.map(|u| TokenUsage {
+                                    input_tokens: u.prompt_tokens,
+                                    output_tokens: u.completion_tokens,
+                                    thinking_tokens: 0,
+                                }).unwrap_or_default();
+                                tx.send(StreamEvent::Delta { content: content.clone(), usage: Some(usage.clone()) }).await.ok();
+                                tx.send(StreamEvent::Done { content, usage }).await.ok();
                             }
                             Err(e) => {
-                                warn!("Failed to parse SSE chunk: {e}");
+                                tx.send(StreamEvent::Error(format!("Parse error: {e}"))).await.ok();
                             }
                         }
                     }
+                    Ok(r) => {
+                        let b = r.text().await.unwrap_or_default();
+                        tx.send(StreamEvent::Error(format!("Stream {status} — {body}; non-stream also failed: {b}"))).await.ok();
+                    }
                     Err(e) => {
-                        tx.send(StreamEvent::Error(format!("Stream error: {e}"))).await.ok();
+                        tx.send(StreamEvent::Error(format!("Stream {status} — {body}; fallback failed: {e}"))).await.ok();
+                    }
+                }
+                return;
+            }
+
+            // Parse SSE manually from byte stream
+            use futures_util::StreamExt;
+            let mut byte_stream = resp.bytes_stream();
+            let mut buf = String::new();
+            let mut full_text = String::new();
+            let mut usage = TokenUsage::default();
+
+            while let Some(chunk) = byte_stream.next().await {
+                let bytes = match chunk {
+                    Ok(b) => b,
+                    Err(e) => {
+                        // Stream broken mid-way — fall back to non-streaming
+                        let mut ns = req.clone();
+                        ns.stream = false;
+                        if let Ok(r) = client
+                            .post(&url)
+                            .header("Authorization", format!("Bearer {api_key}"))
+                            .json(&ns)
+                            .send()
+                            .await
+                        {
+                            if r.status().is_success() {
+                                if let Ok(data) = r.json::<OpenAiChatResponse>().await {
+                                    let content = data.choices.into_iter().next()
+                                        .map(|c| c.message.content.unwrap_or_default())
+                                        .unwrap_or_default();
+                                    let u = data.usage.map(|u| TokenUsage {
+                                        input_tokens: u.prompt_tokens,
+                                        output_tokens: u.completion_tokens,
+                                        thinking_tokens: 0,
+                                    }).unwrap_or_default();
+                                    tx.send(StreamEvent::Delta { content: content.clone(), usage: Some(u.clone()) }).await.ok();
+                                    tx.send(StreamEvent::Done { content, usage: u }).await.ok();
+                                    return;
+                                }
+                            }
+                        }
+                        tx.send(StreamEvent::Error(format!("Stream broken: {e}"))).await.ok();
                         return;
+                    }
+                };
+                buf.push_str(&String::from_utf8_lossy(&bytes));
+
+                // Process complete SSE events (delimited by \n\n)
+                while let Some(pos) = buf.find("\n\n") {
+                    let event = buf[..pos].to_string();
+                    buf = buf[pos + 2..].to_string();
+
+                    for line in event.lines() {
+                        if let Some(data) = line.strip_prefix("data: ") {
+                            if data == "[DONE]" {
+                                tx.send(StreamEvent::Done { content: full_text.clone(), usage: usage.clone() }).await.ok();
+                                return;
+                            }
+                            match serde_json::from_str::<OpenAiStreamChunk>(data) {
+                                Ok(chunk) => {
+                                    if let Some(choice) = chunk.choices.into_iter().next() {
+                                        if let Some(delta) = choice.delta.content {
+                                            full_text.push_str(&delta);
+                                            tx.send(StreamEvent::Delta {
+                                                content: delta,
+                                                usage: None,
+                                            }).await.ok();
+                                        }
+                                        if choice.finish_reason.is_some() {
+                                            if let Some(u) = &chunk.usage {
+                                                usage = TokenUsage {
+                                                    input_tokens: u.prompt_tokens,
+                                                    output_tokens: u.completion_tokens,
+                                                    thinking_tokens: 0,
+                                                };
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("SSE parse error: {e}");
+                                }
+                            }
+                        }
                     }
                 }
             }
 
+            // Stream ended without [DONE] — send what we have
             tx.send(StreamEvent::Done { content: full_text, usage }).await.ok();
         });
 
         Ok(rx)
     }
-
     // ── Anthropic messages API (non-streaming) ──────────────────────────
 
     async fn chat_anthropic(
