@@ -1,0 +1,398 @@
+use std::time::Duration;
+
+use futures_util::StreamExt;
+use reqwest::Client as HttpClient;
+use reqwest_eventsource::{Event, RequestBuilderExt};
+use tracing::{debug, warn};
+
+use crate::error::{AiError, Result};
+use crate::models::*;
+use crate::params::GenerateParams;
+
+/// A client for interacting with AI models via OpenAI-compatible or Anthropic APIs.
+#[derive(Debug, Clone)]
+pub struct AiClient {
+    http: HttpClient,
+    model: Model,
+}
+
+impl AiClient {
+    /// Create a new client for the given model.
+    pub fn new(model: Model) -> Result<Self> {
+        let http = HttpClient::builder()
+            .timeout(Duration::from_secs(300))
+            .build()?;
+
+        Ok(Self { http, model })
+    }
+
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    // ── public API ─────────────────────────────────────────────────────
+
+    /// Send a non-streaming chat completion request.
+    pub async fn chat(&self, messages: &[Message], params: &GenerateParams) -> Result<Completion> {
+        match self.model.api {
+            ApiType::OpenAiCompletions => self.chat_openai(messages, params).await,
+            ApiType::AnthropicMessages => self.chat_anthropic(messages, params).await,
+        }
+    }
+
+    /// Send a streaming chat completion request.
+    ///
+    /// Returns a receiver that yields `StreamEvent` values as they arrive.
+    pub async fn chat_stream(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        match self.model.api {
+            ApiType::OpenAiCompletions => self.stream_openai(messages, params).await,
+            ApiType::AnthropicMessages => self.stream_anthropic(messages, params).await,
+        }
+    }
+
+    // ── OpenAI chat completions (non-streaming) ─────────────────────────
+
+    async fn chat_openai(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+    ) -> Result<Completion> {
+        let url = format!(
+            "{}/chat/completions",
+            self.model.base_url.trim_end_matches('/')
+        );
+
+        let req = self.build_openai_request(messages, params, false);
+        debug!(url, model = %req.model, "OpenAI request");
+
+        let resp = self.http
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.model.api_key))
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AiError::Other("Request timed out".into())
+                } else if e.is_connect() {
+                    AiError::Other(format!("Connection failed: {}", e))
+                } else {
+                    AiError::Http(e)
+                }
+            })?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(if status.as_u16() == 429 {
+                AiError::RateLimited { retry_after: 10.0, message: body }
+            } else if status.as_u16() == 401 {
+                AiError::Auth(body)
+            } else {
+                AiError::Api { status: status.as_u16(), message: body }
+            });
+        }
+
+        let data: OpenAiChatResponse = resp.json().await?;
+        let choice = data.choices.into_iter().next()
+            .ok_or_else(|| AiError::Other("No choices in response".into()))?;
+
+        Ok(Completion {
+            content: choice.message.content.unwrap_or_default(),
+            stop_reason: choice.finish_reason.unwrap_or_default(),
+            usage: TokenUsage {
+                input_tokens: data.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+                output_tokens: data.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+                thinking_tokens: 0,
+            },
+        })
+    }
+
+    // ── OpenAI chat completions (streaming) ─────────────────────────────
+
+    async fn stream_openai(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        let url = format!(
+            "{}/chat/completions",
+            self.model.base_url.trim_end_matches('/')
+        );
+
+        let req = self.build_openai_request(messages, params, true);
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let client = self.http.clone();
+        let api_key = self.model.api_key.clone();
+
+        tokio::spawn(async move {
+            let es = match client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&req)
+                .eventsource()
+            {
+                Ok(es) => es,
+                Err(e) => {
+                    tx.send(StreamEvent::Error(format!("Failed to open stream: {e}"))).await.ok();
+                    return;
+                }
+            };
+
+            let mut full_text = String::new();
+            let mut usage = TokenUsage::default();
+
+            let mut es = es;
+            while let Some(event) = es.next().await {
+                match event {
+                    Ok(Event::Open) => continue,
+                    Ok(Event::Message(msg)) => {
+                        if msg.data == "[DONE]" {
+                            break;
+                        }
+                        match serde_json::from_str::<OpenAiStreamChunk>(&msg.data) {
+                            Ok(chunk) => {
+                                if let Some(choice) = chunk.choices.into_iter().next() {
+                                    if let Some(delta) = choice.delta.content {
+                                        full_text.push_str(&delta);
+                                        tx.send(StreamEvent::Delta {
+                                            content: delta,
+                                            usage: None,
+                                        }).await.ok();
+                                    }
+                                    if choice.finish_reason.is_some() {
+                                        if let Some(u) = &chunk.usage {
+                                            usage = TokenUsage {
+                                                input_tokens: u.prompt_tokens,
+                                                output_tokens: u.completion_tokens,
+                                                thinking_tokens: 0,
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse SSE chunk: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tx.send(StreamEvent::Error(format!("Stream error: {e}"))).await.ok();
+                        return;
+                    }
+                }
+            }
+
+            tx.send(StreamEvent::Done { content: full_text, usage }).await.ok();
+        });
+
+        Ok(rx)
+    }
+
+    // ── Anthropic messages API (non-streaming) ──────────────────────────
+
+    async fn chat_anthropic(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+    ) -> Result<Completion> {
+        let url = format!(
+            "{}/v1/messages",
+            self.model.base_url.trim_end_matches('/')
+        );
+
+        let req = self.build_anthropic_request(messages, params, false);
+        debug!(url, model = %req.model, "Anthropic request");
+
+        let resp = self.http
+            .post(&url)
+            .header("x-api-key", &self.model.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .json(&req)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(if status.as_u16() == 429 {
+                AiError::RateLimited { retry_after: 30.0, message: body }
+            } else {
+                AiError::Api { status: status.as_u16(), message: body }
+            });
+        }
+
+        let data: AnthropicResponse = resp.json().await?;
+
+        let mut content = String::new();
+        for block in &data.content {
+            if let Some(text) = &block.text {
+                content.push_str(text);
+            }
+        }
+
+        Ok(Completion {
+            content,
+            stop_reason: data.stop_reason.unwrap_or_default(),
+            usage: TokenUsage {
+                input_tokens: data.usage.input_tokens,
+                output_tokens: data.usage.output_tokens,
+                thinking_tokens: 0,
+            },
+        })
+    }
+
+    // ── Anthropic messages API (streaming) ──────────────────────────────
+
+    async fn stream_anthropic(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+    ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        let url = format!(
+            "{}/v1/messages",
+            self.model.base_url.trim_end_matches('/')
+        );
+
+        let req = self.build_anthropic_request(messages, params, true);
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        let client = self.http.clone();
+        let api_key = self.model.api_key.clone();
+
+        tokio::spawn(async move {
+            let es = match client
+                .post(&url)
+                .header("x-api-key", &api_key)
+                .header("anthropic-version", "2023-06-01")
+                .json(&req)
+                .eventsource()
+            {
+                Ok(es) => es,
+                Err(e) => {
+                    tx.send(StreamEvent::Error(format!("Failed to open stream: {e}"))).await.ok();
+                    return;
+                }
+            };
+
+            let mut full_text = String::new();
+            let mut usage = TokenUsage::default();
+
+            let mut es = es;
+            while let Some(event) = es.next().await {
+                match event {
+                    Ok(Event::Open) => continue,
+                    Ok(Event::Message(msg)) => {
+                        match serde_json::from_str::<AnthropicStreamEvent>(&msg.data) {
+                            Ok(evt) => {
+                                match evt.type_.as_str() {
+                                    "content_block_delta" => {
+                                        if let Some(delta) = &evt.delta {
+                                            if let Some(text) = &delta.text {
+                                                full_text.push_str(text);
+                                                tx.send(StreamEvent::Delta {
+                                                    content: text.clone(),
+                                                    usage: None,
+                                                }).await.ok();
+                                            }
+                                        }
+                                    }
+                                    "message_delta" => {
+                                        if let Some(u) = &evt.usage {
+                                            usage = TokenUsage {
+                                                input_tokens: u.input_tokens,
+                                                output_tokens: u.output_tokens,
+                                                thinking_tokens: 0,
+                                            };
+                                        }
+                                    }
+                                    "message_stop" => {
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse Anthropic SSE: {e} body={}", msg.data);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tx.send(StreamEvent::Error(format!("Stream error: {e}"))).await.ok();
+                        return;
+                    }
+                }
+            }
+
+            tx.send(StreamEvent::Done { content: full_text, usage }).await.ok();
+        });
+
+        Ok(rx)
+    }
+
+    // ── Request builders ───────────────────────────────────────────────
+
+    fn build_openai_request(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+        stream: bool,
+    ) -> OpenAiChatRequest {
+        OpenAiChatRequest {
+            model: self.model.id.clone(),
+            messages: messages.iter().map(|m| OpenAiMessage {
+                role: match m.role {
+                    Role::System => "system",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                }.into(),
+                content: m.content.clone(),
+            }).collect(),
+            temperature: params.temperature,
+            top_p: params.top_p,
+            top_k: params.top_k,
+            min_p: params.min_p,
+            presence_penalty: params.presence_penalty,
+            frequency_penalty: params.frequency_penalty,
+            repetition_penalty: params.repetition_penalty,
+            max_tokens: params.max_tokens,
+            stop: params.stop_sequences.clone(),
+            seed: params.seed,
+            stream,
+        }
+    }
+
+    fn build_anthropic_request(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+        _stream: bool,
+    ) -> AnthropicRequest {
+        let max_tokens = params.max_tokens.unwrap_or(self.model.max_tokens);
+        let thinking = params.thinking_budget.map(|tb| AnthropicThinking {
+            type_: "enabled".into(),
+            budget_tokens: tb.token_budget(),
+        });
+
+        AnthropicRequest {
+            model: self.model.id.clone(),
+            messages: messages.iter().map(|m| AnthropicMessage {
+                role: match m.role {
+                    Role::System => "user",
+                    Role::User => "user",
+                    Role::Assistant => "assistant",
+                }.into(),
+                content: m.content.clone(),
+            }).collect(),
+            max_tokens,
+            temperature: params.temperature,
+            top_p: params.top_p,
+            top_k: params.top_k,
+            stop_sequences: params.stop_sequences.clone(),
+            thinking,
+        }
+    }
+}
