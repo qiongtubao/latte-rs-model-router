@@ -39,6 +39,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::models::TokenUsage;
+
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -710,13 +712,15 @@ pub struct VendorStatus {
 /// ```
 pub struct VendorRegistry {
     vendors: HashMap<VendorId, VendorConfig>,
+    /// Per-vendor cumulative usage (token / cost) — see `record_usage` / `usage`
+    usages: Arc<parking_lot::RwLock<HashMap<VendorId, VendorUsage>>>,
 }
 
 impl VendorRegistry {
-    /// 创建 registry
     pub fn new(vendors: Vec<VendorConfig>) -> Self {
         Self {
             vendors: vendors.into_iter().map(|v| (v.id.clone(), v)).collect(),
+            usages: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -759,6 +763,38 @@ impl VendorRegistry {
             .ok_or_else(|| VendorError::NotImplemented(format!("vendor not found: {id}")))?;
         let token = v.auth.token().await?;
         v.discovery.discover(&v.base_url, &token).await
+    }
+    /// Record a chat's token usage + cost for the given vendor.
+    ///
+    /// 调用方在 `chat()` 返 `Completion` 后手动调用（或通过 `Dispatcher::record_usage` 间接调）。
+    /// 未知 vendor 静默忽略（不报错），方便部分 registry 的使用。
+    pub fn record_usage(&self, id: &VendorId, usage: &TokenUsage, cost_usd: f64) {
+        if !self.vendors.contains_key(id) {
+            return; // 未知 vendor = 静默 no-op
+        }
+        let mut usages = self.usages.write();
+        let entry = usages.entry(id.clone()).or_default();
+        entry.request_count += 1;
+        entry.input_tokens += usage.input_tokens as u64;
+        entry.output_tokens += usage.output_tokens as u64;
+        entry.thinking_tokens += usage.thinking_tokens as u64;
+        entry.total_cost_usd += cost_usd;
+        entry.last_request_at = Some(Instant::now());
+    }
+
+    /// Get a snapshot of cumulative usage for one vendor
+    pub fn usage(&self, id: &VendorId) -> Option<VendorUsage> {
+        self.usages.read().get(id).cloned()
+    }
+
+    /// Get snapshots of cumulative usage for all vendors that have been recorded
+    pub fn usages(&self) -> HashMap<VendorId, VendorUsage> {
+        self.usages.read().clone()
+    }
+
+    /// Reset all usage stats (e.g., for billing period rollover)
+    pub fn reset_usage(&self) {
+        self.usages.write().clear();
     }
 
     /// 检查 vendor 健康 + token 状态（不触发 refresh）
@@ -1322,5 +1358,178 @@ mod dispatcher_tests {
             }
             _ => panic!("expected FeatureDisabled"),
         }
+    }
+}
+// ── Token / cost usage tracking ────────────────────────────────────────
+
+/// Per-vendor cumulative usage stats
+///
+/// Updated by [`VendorRegistry::record_usage`] 在每次 `chat()` 返 `Completion` 之后由
+/// 调用方手动 record（也可由 dispatcher 自动 record，见 `Dispatcher::record_usage`）。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VendorUsage {
+    /// 累计请求数
+    pub request_count: u64,
+    /// 累计 input tokens
+    pub input_tokens: u64,
+    /// 累计 output tokens
+    pub output_tokens: u64,
+    /// 累计 thinking tokens
+    pub thinking_tokens: u64,
+    /// 累计花费（USD）
+    pub total_cost_usd: f64,
+    /// 上次 record 的 wall-clock 时间
+    pub last_request_at: Option<std::time::Instant>,
+}
+
+impl VendorUsage {
+    /// 平均 input tokens / request
+    pub fn avg_input_tokens(&self) -> f64 {
+        if self.request_count == 0 {
+            0.0
+        } else {
+            self.input_tokens as f64 / self.request_count as f64
+        }
+    }
+
+    /// 平均 output tokens / request
+    pub fn avg_output_tokens(&self) -> f64 {
+        if self.request_count == 0 {
+            0.0
+        } else {
+            self.output_tokens as f64 / self.request_count as f64
+        }
+    }
+
+    /// 平均花费 / request
+    pub fn avg_cost_usd(&self) -> f64 {
+        if self.request_count == 0 {
+            0.0
+        } else {
+            self.total_cost_usd / self.request_count as f64
+        }
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+    use crate::models::TokenUsage;
+    use crate::vendor_toml::registry_from_toml_str;
+
+    fn make_registry() -> VendorRegistry {
+        let toml = r#"
+            [[vendors]]
+            id = "anthropic"
+            base_url = "https://api.anthropic.com"
+            auth = { type = "api_key", key = "k" }
+        "#;
+        registry_from_toml_str(toml).expect("parse")
+    }
+
+    #[test]
+    fn fresh_vendor_has_no_recorded_usage() {
+        let reg = make_registry();
+        // 未 record_usage → usage() 返 None；unwrap_or_default() 拿默认值
+        let u = reg.usage(&"anthropic".into());
+        assert!(u.is_none());
+        let u = u.unwrap_or_default();
+        assert_eq!(u.request_count, 0);
+        assert_eq!(u.input_tokens, 0);
+        assert_eq!(u.output_tokens, 0);
+        assert_eq!(u.total_cost_usd, 0.0);
+    }
+
+    #[test]
+    fn unknown_vendor_returns_none() {
+        let reg = make_registry();
+        assert!(reg.usage(&"ghost".into()).is_none());
+    }
+
+    #[test]
+    fn record_usage_increments_counts() {
+        let reg = make_registry();
+        let id = VendorId::new("anthropic");
+        reg.record_usage(
+            &id,
+            &TokenUsage {
+                input_tokens: 100,
+                output_tokens: 50,
+                thinking_tokens: 10,
+                ..Default::default()
+            },
+            0.001,
+        );
+        reg.record_usage(
+            &id,
+            &TokenUsage {
+                input_tokens: 200,
+                output_tokens: 80,
+                thinking_tokens: 20,
+                ..Default::default()
+            },
+            0.002,
+        );
+        let u = reg.usage(&id).expect("usage");
+        assert_eq!(u.request_count, 2);
+        assert_eq!(u.input_tokens, 300);
+        assert_eq!(u.output_tokens, 130);
+        assert_eq!(u.thinking_tokens, 30);
+        assert!((u.total_cost_usd - 0.003).abs() < 1e-9);
+        assert!(u.last_request_at.is_some());
+        // averages
+        assert!((u.avg_input_tokens() - 150.0).abs() < 1e-9);
+        assert!((u.avg_output_tokens() - 65.0).abs() < 1e-9);
+        assert!((u.avg_cost_usd() - 0.0015).abs() < 1e-9);
+    }
+
+    #[test]
+    fn usages_returns_all_vendors() {
+        let reg = make_registry();
+        let id = VendorId::new("anthropic");
+        reg.record_usage(
+            &id,
+            &TokenUsage {
+                input_tokens: 10,
+                ..Default::default()
+            },
+            0.0,
+        );
+        let all = reg.usages();
+        assert_eq!(all.len(), 1);
+        assert!(all.contains_key(&id));
+    }
+
+    #[test]
+    fn record_usage_concurrent_safe() {
+        use std::sync::Arc;
+        use std::thread;
+        let reg = Arc::new(make_registry());
+        let id = VendorId::new("anthropic");
+        let mut handles = vec![];
+        for _ in 0..8 {
+            let reg = reg.clone();
+            let id = id.clone();
+            handles.push(thread::spawn(move || {
+                for _ in 0..100 {
+                    reg.record_usage(
+                        &id,
+                        &TokenUsage {
+                            input_tokens: 1,
+                            output_tokens: 2,
+                            ..Default::default()
+                        },
+                        0.0,
+                    );
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        let u = reg.usage(&id).expect("usage");
+        assert_eq!(u.request_count, 800);
+        assert_eq!(u.input_tokens, 800);
+        assert_eq!(u.output_tokens, 1600);
     }
 }
