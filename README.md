@@ -4,21 +4,27 @@ Rust AI model 客户端库 + 参数调优工具。
 
 ## 项目结构
 
-```
+\`\`\`
 latte-rs-model-router/
-├── latte-ai/          # AI client 库
-│   ├── params.rs      # 生成参数类型: GenerateParams, ThinkingBudget
-│   ├── models.rs      # 模型定义: Model, Message, Role, Completion
-│   ├── client.rs      # 客户端: AiClient (OpenAI + Anthropic)
-│   └── error.rs       # 错误类型
-├── latte-tune/        # 参数调优 CLI 工具
-│   ├── sweeper.rs     # 参数扫描组合
-│   ├── prompts.rs     # 编程测试 prompt 集
-│   └── report.rs      # 结果格式化输出
-├── models.yaml        # 示例模型配置文件 (YAML)
-├── models.toml        # 示例模型配置文件 (TOML, 兼容旧版)
+├── latte-ai/                  # AI client 库
+│   ├── params.rs              # 生成参数类型: GenerateParams, ThinkingBudget
+│   ├── models.rs              # 模型定义: Model, Message, Role, Completion
+│   ├── client.rs              # 客户端: AiClient (OpenAI + Anthropic) + Dispatcher hook
+│   ├── vendor.rs              # 厂商抽象: VendorRegistry / TokenProvider / ModelDiscovery / Dispatcher / VendorUsage
+│   ├── vendor_toml.rs         # vendors.toml 配置解析
+│   ├── error.rs               # 错误类型
+│   ├── examples/              # 示例: vendor_demo, router, streaming, tool_use, prompt_caching, ...
+│   └── tests/                 # 集成测试: vendor_integration (wiremock)
+├── latte-tune/                # 参数调优 CLI 工具
+│   ├── sweeper.rs             # 参数扫描组合
+│   ├── prompts.rs             # 编程测试 prompt 集
+│   ├── report.rs              # 结果格式化输出
+│   └── main.rs                # CLI 入口（含 `vendors` 子命令: list/status/refresh/discover）
+├── models.yaml                # 示例模型配置文件 (YAML)
+├── models.toml                # 示例模型配置文件 (TOML, 兼容旧版)
+├── vendors.toml               # 示例厂商配置 (TOML)
 └── README.md
-```
+\`\`\`
 
 ---
 
@@ -837,4 +843,236 @@ GenerateParams::code_defaults()      // 代码生成: t=0.1, p=0.9, k=40, mp=0.0
 GenerateParams::analysis_defaults()  // 分析/Debug: t=0.2, p=0.9, mp=0.02, mt=8192, thinking=Medium
 GenerateParams::creative_defaults()  // 创意写作: t=0.8, p=0.95, pp=0.1, fp=0.1, mt=4096
 GenerateParams::default()            // 全部 None，使用模型提供商默认值
+```
+
+---
+
+## 6. 厂商抽象 (Vendor Abstraction)
+
+`latte-ai::vendor` 模块集中管理多 vendor：自动 token 刷新、model 发现、feature 细粒度开关、用量统计、health check。配合 `latte-tune vendors` CLI 直接运维。
+
+### 6.1 核心组件
+
+| 类型 | 作用 |
+|------|------|
+| `VendorId` | Vendor 标识 newtype，防止字符串拼写错 |
+| `TokenProvider` (trait) | 抽象 token 供应 |
+| `ApiKeyProvider` | 静态 API key 实现 |
+| `BearerProvider` | Bearer token + 自动 refresh |
+| `FixedIntervalRefresher` | 固定间隔自动 refresh 回调 |
+| `ModelDiscovery` (trait) | 抽象 model 列表发现 |
+| `AnthropicModelsApi` / `OpenAiModelsApi` | 通过 `/v1/models` API 拉取 |
+| `Manual` | 静态 model 列表 |
+| `VendorConfig` | 单个 vendor 完整配置（auth / discovery / health / disabled_features） |
+| `VendorRegistry` | 多 vendor 中央索引（`Arc<HashMap<VendorId, VendorConfig>>`） |
+| `VendorStatus` | 运行时状态：`auth_valid` / `token_remaining_secs` / `health_ok` / `health_latency_ms` |
+| `VendorUsage` | 累计 token / 花费统计 |
+| `HealthCheck` | HTTP / TCP / None 健康检查策略 |
+| `VendorFeature` | 功能枚举：`PromptCaching` / `ExtendedCacheTtl` / `ToolUse` / `Thinking` / `Vision` / `Stream` / `Reasoning` |
+| `Dispatcher` | feature gate hook，挂在 `AiClient` 上 fail-fast 拦截禁用功能 |
+
+### 6.2 TOML 配置文件
+
+推荐 `vendors.toml` 集中管理所有 vendor。`latte-tune vendors` 自动发现路径（与 `models.yaml` 一致）：
+
+1. `--config <path>` 显式指定
+2. `./vendors.toml`
+3. `~/.latte/vendors.toml`
+
+格式：
+
+```toml
+# vendors.toml
+[[vendors]]
+id = "anthropic"
+protocol = "anthropic"
+base_url = "https://api.anthropic.com"
+auth = { type = "api_key", key = "${ANTHROPIC_API_KEY}" }
+disabled_features = ["extended_cache_ttl"]
+health_check = { type = "http", path = "/v1/messages" }
+discovery = "anthropic"
+
+[[vendors]]
+id = "deepseek"
+protocol = "openai"
+base_url = "https://api.deepseek.com"
+# Bearer + 1h 自动刷新，刷新时从 DEEPSEEK_TOKEN env 读新值
+auth = { type = "bearer", token = "initial", interval_secs = 3600, refresh_env = "DEEPSEEK_TOKEN" }
+discovery = "openai"
+
+[[vendors]]
+id = "local-ollama"
+base_url = "http://localhost:11434"
+auth = { type = "api_key", key = "ollama" }
+discovery = { type = "manual", models = [
+    { id = "qwen2.5-coder:7b", display_name = "Qwen 2.5 Coder 7B", context_window = 8192 },
+    { id = "llama3.1:8b",      display_name = "Llama 3.1 8B" }
+] }
+```
+
+字段说明：
+
+| 字段 | 必填 | 默认 | 说明 |
+|------|------|------|------|
+| `id` | ✓ | — | Vendor 唯一标识 |
+| `base_url` | ✓ | — | API 端点 |
+| `auth` | ✓ | — | `{ type = "api_key", key = "..." }` 或 `{ type = "bearer", token = "...", interval_secs = 3600, refresh_env = "ENV_VAR" }` |
+| `protocol` | ✗ | `"openai"` | 仅用于 metrics / 调试；wire format 由 discovery impl 决定 |
+| `discovery` | ✗ | 空 manual | `"openai"` / `"anthropic"` 简写 或 `{ type = "manual", models = [...] }` |
+| `health_check` | ✗ | `None` | `{ type = "http", path = "/..." }` / `"tcp"` / `"none"` |
+| `disabled_features` | ✗ | `[]` | 禁用的 `VendorFeature` 列表（snake_case 字符串） |
+
+### 6.3 程序化使用
+
+```rust
+use latte_ai::vendor_toml::registry_from_toml_str;
+use latte_ai::vendor::{Dispatcher, VendorId, VendorFeature};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+// 1. 加载 registry
+let reg = Arc::new(registry_from_toml_str(include_str!("../vendors.toml"))?);
+
+// 2. 拿 token
+let token = reg.get_token(&VendorId::new("anthropic")).await?;
+
+// 3. 拉 model 列表
+let models = reg.discover_models(&VendorId::new("anthropic")).await?;
+
+// 4. 强制 refresh
+let new_token = reg.refresh_now(&VendorId::new("deepseek")).await?;
+
+// 5. 查状态
+let status = reg.status(&VendorId::new("anthropic")).await?;
+println!("auth_valid={}, health_ok={}", status.auth_valid, status.health_ok);
+
+// 6. Record 用量（chat() 返 Completion 后手动调）
+reg.record_usage(
+    &VendorId::new("anthropic"),
+    &completion.usage,
+    cost_usd,
+);
+let total = reg.usage(&VendorId::new("anthropic")).unwrap_or_default();
+println!("累计 {} 次请求，{} tokens，${:.4}",
+    total.request_count,
+    total.input_tokens + total.output_tokens,
+    total.total_cost_usd);
+```
+
+### 6.4 配合 AiClient + Dispatcher
+
+Dispatcher 在 `chat()` 入口拦截 vendor 禁用的 feature，fail-fast：
+
+```rust
+use latte_ai::AiClient;
+use latte_ai::vendor::{Dispatcher, VendorFeature};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+let reg = Arc::new(registry_from_toml_str(toml)?);
+let dispatcher = Arc::new(Dispatcher::new(reg));
+
+let model = Model { provider: "anthropic".into(), /* ... */ .. };
+let client = AiClient::new(model)?.with_dispatcher(dispatcher);
+
+// 请求时声明用到的 features
+let requested: HashSet<VendorFeature> = [
+    VendorFeature::PromptCaching,
+    VendorFeature::ToolUse,
+].into_iter().collect();
+
+match client.chat_with_features(&messages, &params, &requested).await {
+    Ok(c) => println!("ok: {}", c.content),
+    Err(e) if format!("{e}").contains("disabled") => {
+        eprintln!("vendor 禁用了该 feature: {e}");
+    }
+    Err(e) => return Err(e.into()),
+}
+```
+
+若 vendor 的 `disabled_features` 包含 `PromptCaching` 或 `ToolUse`，`chat_with_features` 会立即返 `Err(AiError::Other("vendor: feature ... disabled for vendor ..."))`，**不会发起 HTTP 请求**。
+
+### 6.5 CLI: `latte-tune vendors`
+
+```bash
+# 列出所有 vendor（id / base_url / auth_kind / disabled features）
+latte-tune vendors list
+
+# 查 vendor 状态（auth / token 剩余 / health）
+latte-tune vendors status anthropic
+
+# 强制刷新 token（返 masked token）
+latte-tune vendors refresh deepseek
+
+# 拉 vendor 的 model 列表
+latte-tune vendors discover anthropic
+
+# 指定非默认配置
+latte-tune vendors --config /etc/latte/vendors.toml list
+```
+
+输出示例：
+
+```
+$ latte-tune vendors list
+Configured vendors (2):
+  anthropic    https://api.anthropic.com  api_key  disabled=[extendedcachettl]
+  local-ollama http://localhost:11434     api_key  disabled=[-]
+
+$ latte-tune vendors status anthropic
+Vendor: anthropic
+  auth_kind:    api_key
+  auth_valid:   yes
+  token_left:   never expires
+  health:       ok (243ms)
+```
+
+### 6.6 用量统计（Token Usage）
+
+`VendorUsage` 提供每个 vendor 累计统计：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `request_count` | `u64` | 累计请求数 |
+| `input_tokens` | `u64` | 累计 input token |
+| `output_tokens` | `u64` | 累计 output token |
+| `thinking_tokens` | `u64` | 累计 thinking token |
+| `total_cost_usd` | `f64` | 累计花费（美元） |
+| `last_request_at` | `Option<Instant>` | 上次 record 时间 |
+
+派生方法：`avg_input_tokens` / `avg_output_tokens` / `avg_cost_usd`。
+
+`record_usage` 由调用方在每次 `chat()` 完成后手动调用（可包装成中间件）：
+
+```rust
+let cost = (usage.input_tokens  as f64 / 1_000_000.0) * model.cost_per_million_input
+         + (usage.output_tokens as f64 / 1_000_000.0) * model.cost_per_million_output;
+reg.record_usage(&VendorId::new(&model.provider), &usage, cost);
+```
+
+`reset_usage()` 用于账单周期重置。`usages()` 一次性拿所有 vendor 的 snapshot。
+
+### 6.7 完整示例
+
+- `latte-ai/examples/vendor_demo.rs` — vendor 抽象 4 步使用示例
+- `latte-ai/tests/vendor_integration.rs` — wiremock 集成测试（11 个）
+- 单元测试 38 个 + doctest 4 个，**共 62/62 通过**
+
+---
+
+## 7. 开发与测试
+
+```bash
+# 全量测试（62 个）
+cargo test
+
+# 仅 latte-ai
+cargo test -p latte-ai
+
+# 编译验证
+cargo build --release
+
+# 跑 vendor CLI（需要先有 vendors.toml）
+cargo run -- vendors list
+cargo run -- vendors status anthropic
 ```
