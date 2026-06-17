@@ -1,46 +1,48 @@
-//! 厂商抽象：VendorId + TokenProvider + ModelDiscovery
+//! 厂商抽象：VendorId + TokenProvider + ModelDiscovery + VendorRegistry
 //!
-//! # Session 2 范围
+//! # Session 3 范围
 //!
 //! - `VendorId` newtype
 //! - `VendorError` 错误类型
 //! - [`TokenProvider`] trait + [`ApiKeyProvider`] / [`BearerProvider`] impl
 //! - [`ModelDescriptor`] 轻量结构
 //! - [`ModelDiscovery`] trait + [`discover::AnthropicModelsApi`] / [`discover::OpenAiModelsApi`] impl
+//! - [`VendorConfig`] 完整 vendor 配置
+//! - [`VendorRegistry`] 集中管理多个 vendor
+//! - [`VendorStatus`] 状态查询结果
+//! - [`HealthCheck`] 健康检查策略
+//! - [`VendorFeature`] 厂商功能细粒度开关
 //!
 //! # 后续 sessions（不在本 session 范围）
 //!
-//! - Session 3: VendorRegistry + config 解析（V1/V2 兼容）
 //! - Session 4: 单测 + examples
 //!
 //! # 用法
 //!
 //! ```no_run
-//! use latte_ai::vendor::{ApiKeyProvider, TokenProvider};
+//! use std::sync::Arc;
+//! use latte_ai::vendor::{
+//!     ApiKeyProvider, AnthropicModelsApi, VendorConfig, VendorId, VendorRegistry,
+//! };
 //!
 //! # async fn example() -> Result<(), latte_ai::vendor::VendorError> {
-//! // 静态 API key
-//! let api = ApiKeyProvider::new("anthropic", "${ANTHROPIC_API_KEY}");
-//! let token = api.token().await?;
+//! let reg = VendorRegistry::new(vec![
+//!     VendorConfig::new(
+//!         VendorId::new("anthropic"),
+//!         "https://api.anthropic.com",
+//!         Arc::new(ApiKeyProvider::new("anthropic", "${ANTHROPIC_API_KEY}")),
+//!         Arc::new(AnthropicModelsApi),
+//!     ),
+//! ]);
 //!
-//! // Bearer + 固定间隔刷新
-//! use latte_ai::vendor::bearer::FixedIntervalRefresher;
-//! let refresher = FixedIntervalRefresher::new(
-//!     std::time::Duration::from_secs(3600),
-//!     || Box::pin(async { Ok("refreshed-token".into()) }),
-//! );
-//! let bearer = BearerProvider::new("anthropic", "initial-token", refresher);
-//! let token = bearer.token().await?;
-//!
-//! // Discover models
-//! use latte_ai::vendor::{ModelDiscovery, discover::AnthropicModelsApi};
-//! let discover = AnthropicModelsApi;
-//! let models = discover.discover("https://api.anthropic.com", &token).await?;
+//! let token = reg.get_token(&VendorId::new("anthropic")).await?;
+//! let status = reg.status(&VendorId::new("anthropic")).await?;
+//! let models = reg.discover_models(&VendorId::new("anthropic")).await?;
 //! # Ok(())
 //! # }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -506,7 +508,7 @@ pub mod discover {
             let status = resp.status();
             if !status.is_success() {
                 return Err(VendorError::Network(format!(
-                    "openai /v1/models returned {status}"
+                    "openai /v1 models returned {status}"
                 )));
             }
             let body: serde_json::Value = resp
@@ -557,6 +559,262 @@ pub mod discover {
             _auth_token: &str,
         ) -> VendorResult<Vec<ModelDescriptor>> {
             Ok(self.0.clone())
+        }
+    }
+}
+
+// ─── VendorConfig + Registry + Status + Features ────────────
+
+/// Vendor 可禁用的功能（细粒度开关，per-vendor 配置；可被 model-level 覆盖）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VendorFeature {
+    /// Anthropic prompt caching（ephemeral / long TTL）
+    PromptCaching,
+    /// 1 小时 cache TTL（`extended-cache-ttl-2025-04-11` beta header）
+    ExtendedCacheTtl,
+    /// Tool use / function calling
+    ToolUse,
+    /// Thinking / reasoning budget
+    Thinking,
+    /// 视觉（图输入）
+    Vision,
+    /// Streaming response
+    Stream,
+    /// o1 / o3 reasoning_effort
+    Reasoning,
+}
+
+impl VendorFeature {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::PromptCaching => "prompt_caching",
+            Self::ExtendedCacheTtl => "extended_cache_ttl",
+            Self::ToolUse => "tool_use",
+            Self::Thinking => "thinking",
+            Self::Vision => "vision",
+            Self::Stream => "stream",
+            Self::Reasoning => "reasoning",
+        }
+    }
+}
+
+/// Vendor 健康检查策略
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HealthCheck {
+    /// HTTP GET 某个路径，要求 2xx
+    Http { path: String },
+    /// 仅 TCP 握手
+    Tcp,
+    /// 不检查
+    None,
+}
+
+impl Default for HealthCheck {
+    fn default() -> Self {
+        HealthCheck::None
+    }
+}
+
+/// Vendor 完整配置（构造 `AiClient` 时用）
+///
+/// 不 derive `Serialize/Deserialize`：`auth: Arc<dyn TokenProvider>` 和
+/// `discovery: Arc<dyn ModelDiscovery>` 是 trait object，没法直接序列化。
+/// 也不 derive `Debug/Clone`：trait object 没法 derive；我们手写 `Debug` impl（不 clone）。
+/// TOML config 走单独的 `VendorConfigToml`（Session 4 写）反序列化后
+/// 构造 trait object，再构造成 `VendorConfig`。
+pub struct VendorConfig {
+    /// Vendor 标识
+    pub id: VendorId,
+    /// Vendor API base URL（无尾斜杠）
+    pub base_url: String,
+    /// Token provider（ApiKey / Bearer / 自定义）
+    pub auth: Arc<dyn TokenProvider>,
+    /// Model discovery strategy（Anthropic / OpenAI / Manual / 自定义）
+    pub discovery: Arc<dyn ModelDiscovery>,
+    /// 可选健康检查
+    pub health_check: Option<HealthCheck>,
+    /// 禁用的厂商功能
+    pub disabled_features: HashSet<VendorFeature>,
+}
+
+impl std::fmt::Debug for VendorConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendorConfig")
+            .field("id", &self.id)
+            .field("base_url", &self.base_url)
+            .field("auth_kind", &self.auth.kind())
+            .field("discovery", &self.discovery.protocol())
+            .field("health_check", &self.health_check)
+            .field("disabled_features", &self.disabled_features)
+            .finish()
+    }
+}
+
+impl VendorConfig {
+    /// 构造 vendor config
+    pub fn new(
+        id: impl Into<VendorId>,
+        base_url: impl Into<String>,
+        auth: Arc<dyn TokenProvider>,
+        discovery: Arc<dyn ModelDiscovery>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            base_url: base_url.into(),
+            auth,
+            discovery,
+            health_check: None,
+            disabled_features: HashSet::new(),
+        }
+    }
+
+    pub fn with_health_check(mut self, hc: HealthCheck) -> Self {
+        self.health_check = Some(hc);
+        self
+    }
+
+    pub fn disable_feature(mut self, f: VendorFeature) -> Self {
+        self.disabled_features.insert(f);
+        self
+    }
+}
+
+/// Vendor 状态查询结果
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VendorStatus {
+    pub vendor: VendorId,
+    /// `"api_key"` / `"bearer"` / custom
+    pub auth_kind: String,
+    /// Token 剩余有效秒数（`None` = 永不过期）
+    pub token_remaining_secs: Option<u64>,
+    /// 当前 token 是否可用
+    pub auth_valid: bool,
+    /// 健康检查延迟（ms）
+    pub health_latency_ms: Option<u64>,
+    /// 健康检查是否通过
+    pub health_ok: bool,
+    /// 上次 discover 出的 model 数
+    pub discovered_models: Option<usize>,
+}
+
+/// VendorRegistry：所有 vendor 的中央索引
+///
+/// 典型用法：
+/// ```no_run
+/// # async fn example(reg: latte_ai::vendor::VendorRegistry) -> Result<(), latte_ai::vendor::VendorError> {
+/// let token = reg.get_token(&"anthropic".into()).await?;
+/// let status = reg.status(&"anthropic".into()).await?;
+/// let models = reg.discover_models(&"anthropic".into()).await?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct VendorRegistry {
+    vendors: HashMap<VendorId, VendorConfig>,
+}
+
+impl VendorRegistry {
+    /// 创建 registry
+    pub fn new(vendors: Vec<VendorConfig>) -> Self {
+        Self {
+            vendors: vendors.into_iter().map(|v| (v.id.clone(), v)).collect(),
+        }
+    }
+
+    /// 拿 vendor 配置
+    pub fn get(&self, id: &VendorId) -> Option<&VendorConfig> {
+        self.vendors.get(id)
+    }
+
+    /// 列出所有 vendor
+    pub fn list(&self) -> Vec<&VendorConfig> {
+        self.vendors.values().collect()
+    }
+
+    /// 拿当前有效 token
+    pub async fn get_token(&self, id: &VendorId) -> VendorResult<String> {
+        let v = self
+            .vendors
+            .get(id)
+            .ok_or_else(|| VendorError::NotImplemented(format!("vendor not found: {id}")))?;
+        v.auth.token().await
+    }
+
+    /// 强制 refresh
+    pub async fn refresh_now(&self, id: &VendorId) -> VendorResult<String> {
+        let v = self
+            .vendors
+            .get(id)
+            .ok_or_else(|| VendorError::NotImplemented(format!("vendor not found: {id}")))?;
+        v.auth.refresh_now().await
+    }
+
+    /// 拉 vendor 的可用 model 列表
+    pub async fn discover_models(
+        &self,
+        id: &VendorId,
+    ) -> VendorResult<Vec<ModelDescriptor>> {
+        let v = self
+            .vendors
+            .get(id)
+            .ok_or_else(|| VendorError::NotImplemented(format!("vendor not found: {id}")))?;
+        let token = v.auth.token().await?;
+        v.discovery.discover(&v.base_url, &token).await
+    }
+
+    /// 检查 vendor 健康 + token 状态（不触发 refresh）
+    pub async fn status(&self, id: &VendorId) -> VendorResult<VendorStatus> {
+        let v = self
+            .vendors
+            .get(id)
+            .ok_or_else(|| VendorError::NotImplemented(format!("vendor not found: {id}")))?;
+        let auth_kind = v.auth.kind().to_string();
+        let auth_valid = !v.auth.is_expired();
+        let token_remaining_secs = {
+            let r = v.auth.remaining();
+            if r >= Duration::from_secs(u64::MAX / 2) {
+                None
+            } else {
+                Some(r.as_secs())
+            }
+        };
+        let (health_ok, health_latency_ms) = self.ping_health(v).await;
+        Ok(VendorStatus {
+            vendor: v.id.clone(),
+            auth_kind,
+            token_remaining_secs,
+            auth_valid,
+            health_latency_ms,
+            health_ok,
+            discovered_models: None,
+        })
+    }
+
+    async fn ping_health(&self, v: &VendorConfig) -> (bool, Option<u64>) {
+        match &v.health_check {
+            Some(HealthCheck::Http { path }) => {
+                let url = format!("{}{}", v.base_url.trim_end_matches('/'), path);
+                let start = std::time::Instant::now();
+                let result = match v.auth.token().await {
+                    Ok(t) => {
+                        let client = reqwest::Client::new();
+                        let req = match v.auth.kind() {
+                            "api_key" => client.get(&url).header("x-api-key", t),
+                            "bearer" => client.get(&url).bearer_auth(t),
+                            _ => client.get(&url),
+                        };
+                        req.send().await
+                    }
+                    Err(_) => reqwest::Client::new().get(&url).send().await,
+                };
+                let latency = start.elapsed().as_millis() as u64;
+                match result {
+                    Ok(resp) if resp.status().is_success() => (true, Some(latency)),
+                    _ => (false, Some(latency)),
+                }
+            }
+            Some(HealthCheck::Tcp) | Some(HealthCheck::None) | None => (true, None),
         }
     }
 }
@@ -652,7 +910,6 @@ mod tests {
         );
         let p = BearerProvider::new("anthropic", "initial", Duration::from_secs(3600), refresher);
         assert!(!p.is_expired());
-        // 强制 refresh — 调 refresh_now（不走 token() 的过期判断）
         let token = p.refresh_now().await.unwrap();
         assert_eq!(token, "forced-new");
     }
@@ -722,5 +979,181 @@ mod tests {
         assert_eq!(AnthropicModelsApi.protocol(), "anthropic");
         assert_eq!(OpenAiModelsApi.protocol(), "openai");
         assert_eq!(ManualDiscover(vec![]).protocol(), "manual");
+    }
+
+    // ── VendorConfig ───────────────────────────────────────
+
+    #[test]
+    fn vendor_config_new_works() {
+        let auth: Arc<dyn TokenProvider> = Arc::new(ApiKeyProvider::new("anthropic", "k"));
+        let discovery: Arc<dyn ModelDiscovery> = Arc::new(ManualDiscover(vec![]));
+        let v = VendorConfig::new(
+            VendorId::new("anthropic"),
+            "https://api.anthropic.com",
+            auth,
+            discovery,
+        );
+        assert_eq!(v.id.0, "anthropic");
+        assert_eq!(v.base_url, "https://api.anthropic.com");
+        assert!(v.disabled_features.is_empty());
+        assert!(v.health_check.is_none());
+    }
+
+    #[test]
+    fn vendor_config_builder_disable_feature() {
+        let auth: Arc<dyn TokenProvider> = Arc::new(ApiKeyProvider::new("anthropic", "k"));
+        let discovery: Arc<dyn ModelDiscovery> = Arc::new(ManualDiscover(vec![]));
+        let v = VendorConfig::new("anthropic", "https://api.x", auth, discovery)
+            .disable_feature(VendorFeature::PromptCaching)
+            .disable_feature(VendorFeature::ToolUse);
+        assert!(v.disabled_features.contains(&VendorFeature::PromptCaching));
+        assert!(v.disabled_features.contains(&VendorFeature::ToolUse));
+        assert!(!v.disabled_features.contains(&VendorFeature::Stream));
+    }
+
+    #[test]
+    fn vendor_feature_strings_are_stable() {
+        assert_eq!(VendorFeature::PromptCaching.as_str(), "prompt_caching");
+        assert_eq!(VendorFeature::ExtendedCacheTtl.as_str(), "extended_cache_ttl");
+        assert_eq!(VendorFeature::ToolUse.as_str(), "tool_use");
+        assert_eq!(VendorFeature::Thinking.as_str(), "thinking");
+        assert_eq!(VendorFeature::Vision.as_str(), "vision");
+        assert_eq!(VendorFeature::Stream.as_str(), "stream");
+        assert_eq!(VendorFeature::Reasoning.as_str(), "reasoning");
+    }
+
+    #[test]
+    fn vendor_config_manual_debug() {
+        let auth: Arc<dyn TokenProvider> = Arc::new(ApiKeyProvider::new("anthropic", "k"));
+        let discovery: Arc<dyn ModelDiscovery> = Arc::new(ManualDiscover(vec![]));
+        let v = VendorConfig::new("anthropic", "https://api.x", auth, discovery);
+        let dbg = format!("{v:?}");
+        assert!(dbg.contains("VendorConfig"));
+        assert!(dbg.contains("anthropic"));
+        assert!(dbg.contains("api_key"));
+    }
+
+    // ── VendorRegistry ─────────────────────────────────────
+
+    fn make_registry() -> VendorRegistry {
+        let auth: Arc<dyn TokenProvider> = Arc::new(ApiKeyProvider::new("anthropic", "k1"));
+        let discovery: Arc<dyn ModelDiscovery> = Arc::new(ManualDiscover(vec![
+            ModelDescriptor::new("claude-sonnet-4", "Claude Sonnet 4"),
+        ]));
+        let v1 = VendorConfig::new(
+            "anthropic",
+            "https://api.anthropic.com",
+            auth,
+            discovery,
+        );
+
+        let auth2: Arc<dyn TokenProvider> = Arc::new(ApiKeyProvider::new("deepseek", "k2"));
+        let discovery2: Arc<dyn ModelDiscovery> = Arc::new(ManualDiscover(vec![
+            ModelDescriptor::new("deepseek-chat", "DeepSeek Chat"),
+        ]));
+        let v2 = VendorConfig::new("deepseek", "https://api.deepseek.com", auth2, discovery2);
+
+        VendorRegistry::new(vec![v1, v2])
+    }
+
+    #[test]
+    fn registry_get_returns_correct_vendor() {
+        let reg = make_registry();
+        let v = reg.get(&VendorId::new("anthropic")).unwrap();
+        assert_eq!(v.base_url, "https://api.anthropic.com");
+        assert!(reg.get(&VendorId::new("missing")).is_none());
+    }
+
+    #[test]
+    fn registry_list_returns_all() {
+        let reg = make_registry();
+        let list = reg.list();
+        assert_eq!(list.len(), 2);
+        let ids: Vec<_> = list.iter().map(|v| v.id.0.clone()).collect();
+        assert!(ids.contains(&"anthropic".to_string()));
+        assert!(ids.contains(&"deepseek".to_string()));
+    }
+
+    #[tokio::test]
+    async fn registry_get_token_returns_vendor_token() {
+        let reg = make_registry();
+        assert_eq!(reg.get_token(&VendorId::new("anthropic")).await.unwrap(), "k1");
+        assert_eq!(reg.get_token(&VendorId::new("deepseek")).await.unwrap(), "k2");
+    }
+
+    #[tokio::test]
+    async fn registry_discover_models_uses_preset_for_manual() {
+        let reg = make_registry();
+        let models = reg.discover_models(&VendorId::new("anthropic")).await.unwrap();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "claude-sonnet-4");
+    }
+
+    #[tokio::test]
+    async fn registry_status_for_api_key() {
+        let reg = make_registry();
+        let s = reg.status(&VendorId::new("anthropic")).await.unwrap();
+        assert_eq!(s.vendor.0, "anthropic");
+        assert_eq!(s.auth_kind, "api_key");
+        assert!(s.auth_valid);
+        // 静态 api key → token_remaining = None
+        assert_eq!(s.token_remaining_secs, None);
+        // health_check = None → health_ok = true, latency = None
+        assert!(s.health_ok);
+        assert_eq!(s.health_latency_ms, None);
+    }
+
+    #[tokio::test]
+    async fn registry_status_for_missing_vendor_errors() {
+        let reg = make_registry();
+        let result = reg.status(&VendorId::new("nope")).await;
+        assert!(matches!(result, Err(VendorError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn registry_status_for_bearer() {
+        let started_at = Instant::now() - Duration::from_secs(120);
+        let refresher = FixedIntervalRefresher::with_started_at(
+            started_at,
+            Duration::from_secs(60),
+            || Box::pin(async { Ok("refreshed".into()) }),
+        );
+        let auth: Arc<dyn TokenProvider> = Arc::new(BearerProvider::with_started_at(
+            "anthropic",
+            "old",
+            started_at,
+            Duration::from_secs(60),
+            refresher,
+        ));
+        let discovery: Arc<dyn ModelDiscovery> = Arc::new(ManualDiscover(vec![]));
+        let v = VendorConfig::new("anthropic", "https://x", auth, discovery);
+        let reg = VendorRegistry::new(vec![v]);
+
+        let s = reg.status(&VendorId::new("anthropic")).await.unwrap();
+        assert_eq!(s.auth_kind, "bearer");
+        // token 已过期（age 120s > interval 60s）→ auth_valid = false
+        assert!(!s.auth_valid);
+        // remaining saturates to 0
+        assert_eq!(s.token_remaining_secs, Some(0));
+    }
+
+    #[tokio::test]
+    async fn registry_refresh_now_delegates_to_provider() {
+        let refresher = FixedIntervalRefresher::new(
+            Duration::from_secs(3600),
+            || Box::pin(async { Ok("refreshed-token".into()) }),
+        );
+        let auth: Arc<dyn TokenProvider> = Arc::new(BearerProvider::new(
+            "anthropic",
+            "initial",
+            Duration::from_secs(3600),
+            refresher,
+        ));
+        let discovery: Arc<dyn ModelDiscovery> = Arc::new(ManualDiscover(vec![]));
+        let v = VendorConfig::new("anthropic", "https://x", auth, discovery);
+        let reg = VendorRegistry::new(vec![v]);
+
+        let token = reg.refresh_now(&VendorId::new("anthropic")).await.unwrap();
+        assert_eq!(token, "refreshed-token");
     }
 }
