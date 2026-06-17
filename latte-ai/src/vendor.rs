@@ -54,6 +54,11 @@ pub enum VendorError {
     EnvMissing(String),
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    #[error("feature {feature:?} disabled for vendor {vendor}")]
+    FeatureDisabled {
+        vendor: VendorId,
+        feature: VendorFeature,
+    },
 }
 
 pub type VendorResult<T> = Result<T, VendorError>;
@@ -1148,5 +1153,174 @@ mod tests {
 
         let token = reg.refresh_now(&VendorId::new("anthropic")).await.unwrap();
         assert_eq!(token, "refreshed-token");
+    }
+}
+// ── Dispatcher ─────────────────────────────────────────────────────
+
+/// 集中执行 vendor 策略（feature gate / token 注入 / 限流）的 hook。
+///
+/// 持有 `Arc<VendorRegistry>` 引用，`check()` 在 `AiClient::chat` 入口处
+/// 拦截禁用特性，避免 vendor 禁用功能被偷偷使用。
+///
+/// # 用法
+///
+/// ```no_run
+/// use std::sync::Arc;
+/// use latte_ai::vendor::{Dispatcher, VendorRegistry, VendorId, VendorFeature};
+/// use std::collections::HashSet;
+///
+/// # async fn example(reg: VendorRegistry) -> Result<(), Box<dyn std::error::Error>> {
+/// let dispatcher = Arc::new(Dispatcher::new(Arc::new(reg)));
+/// let requested: HashSet<VendorFeature> = [VendorFeature::PromptCaching].into_iter().collect();
+/// dispatcher.check(&VendorId::new("anthropic"), &requested)?;
+/// # Ok(())
+/// # }
+/// ```
+pub struct Dispatcher {
+    registry: Arc<VendorRegistry>,
+}
+
+impl Dispatcher {
+    /// 构造 dispatcher
+    pub fn new(registry: Arc<VendorRegistry>) -> Self {
+        Self { registry }
+    }
+
+    /// 拿底层 registry（用于测试 / 高级查询）
+    pub fn registry(&self) -> &Arc<VendorRegistry> {
+        &self.registry
+    }
+
+    /// 检查 vendor 是否允许使用给定 features
+    ///
+    /// 返回值：被禁用的 features（空集 = 全部允许）。
+    /// 行为：发现被禁用的 feature **立即短路**返 `Err(VendorError::FeatureDisabled)`。
+    /// 不做 silent strip —— 调用方要明确知道被拒。
+    ///
+    /// vendor 不存在时返空集（不报错，让调用方继续走）。
+    pub fn check(
+        &self,
+        vendor_id: &VendorId,
+        requested: &HashSet<VendorFeature>,
+    ) -> VendorResult<()> {
+        let Some(v) = self.registry.get(vendor_id) else {
+            return Ok(()); // vendor 未注册 = 无策略 = 放行
+        };
+        for f in requested {
+            if v.disabled_features.contains(f) {
+                return Err(VendorError::FeatureDisabled {
+                    vendor: vendor_id.clone(),
+                    feature: *f,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// 拿到 vendor 配置的 `disabled_features` 引用（用于展示 / 调试）
+    pub fn disabled_features(&self, vendor_id: &VendorId) -> Option<&HashSet<VendorFeature>> {
+        self.registry.get(vendor_id).map(|v| &v.disabled_features)
+    }
+}
+
+impl std::fmt::Debug for Dispatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dispatcher")
+            .field("vendors", &self.registry.list().len())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod dispatcher_tests {
+    use super::*;
+    use std::collections::HashSet;
+    use crate::vendor_toml::registry_from_toml_str;
+
+    fn make_registry() -> VendorRegistry {
+        // 直接用 from_toml 构造最简 registry
+        let toml = r#"
+            [[vendors]]
+            id = "a"
+            base_url = "https://a"
+            auth = { type = "api_key", key = "k" }
+            disabled_features = ["prompt_caching", "tool_use"]
+
+            [[vendors]]
+            id = "b"
+            base_url = "https://b"
+            auth = { type = "api_key", key = "k" }
+        "#;
+        registry_from_toml_str(toml).expect("parse")
+    }
+
+    #[test]
+    fn check_passes_when_no_disabled() {
+        let reg = Arc::new(make_registry());
+        let d = Dispatcher::new(reg);
+        let req: HashSet<VendorFeature> = [VendorFeature::Thinking].into_iter().collect();
+        d.check(&VendorId::new("b"), &req).expect("ok");
+    }
+
+    #[test]
+    fn check_errors_on_disabled_feature() {
+        let reg = Arc::new(make_registry());
+        let d = Dispatcher::new(reg);
+        let req: HashSet<VendorFeature> = [VendorFeature::PromptCaching].into_iter().collect();
+        let err = d
+            .check(&VendorId::new("a"), &req)
+            .expect_err("should fail");
+        assert!(matches!(err, VendorError::FeatureDisabled { .. }));
+    }
+
+    #[test]
+    fn check_passes_for_unknown_vendor() {
+        let reg = Arc::new(make_registry());
+        let d = Dispatcher::new(reg);
+        let req: HashSet<VendorFeature> = [VendorFeature::ToolUse].into_iter().collect();
+        d.check(&VendorId::new("ghost"), &req).expect("unknown vendor ok");
+    }
+
+    #[test]
+    fn check_empty_request_set_always_passes() {
+        let reg = Arc::new(make_registry());
+        let d = Dispatcher::new(reg);
+        d.check(&VendorId::new("a"), &HashSet::new()).expect("empty ok");
+    }
+
+    #[test]
+    fn disabled_features_lookup() {
+        let reg = Arc::new(make_registry());
+        let d = Dispatcher::new(reg);
+        let feats = d
+            .disabled_features(&VendorId::new("a"))
+            .expect("vendor a");
+        assert!(feats.contains(&VendorFeature::PromptCaching));
+        assert!(feats.contains(&VendorFeature::ToolUse));
+        let feats_b = d
+            .disabled_features(&VendorId::new("b"))
+            .expect("vendor b");
+        assert!(feats_b.is_empty());
+    }
+
+    #[test]
+    fn check_returns_first_disabled_only() {
+        let reg = Arc::new(make_registry());
+        let d = Dispatcher::new(reg);
+        // 同时请求 2 个：1 个允许 + 1 个禁用 → 报错
+        let req: HashSet<VendorFeature> = [
+            VendorFeature::Thinking,
+            VendorFeature::ToolUse,
+        ]
+        .into_iter()
+        .collect();
+        let err = d.check(&VendorId::new("a"), &req).expect_err("fail");
+        match err {
+            VendorError::FeatureDisabled { feature, vendor } => {
+                assert_eq!(feature, VendorFeature::ToolUse);
+                assert_eq!(vendor, VendorId::new("a"));
+            }
+            _ => panic!("expected FeatureDisabled"),
+        }
     }
 }

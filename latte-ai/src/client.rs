@@ -7,13 +7,26 @@ use tracing::{debug, warn};
 
 use crate::error::{AiError, Result};
 use crate::models::*;
-use crate::params::GenerateParams;
+use std::collections::HashSet;
+use std::sync::Arc;
 
+use crate::vendor::{Dispatcher, VendorFeature, VendorId};
+use crate::params::GenerateParams;
 /// A client for interacting with AI models via OpenAI-compatible or Anthropic APIs.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AiClient {
     http: HttpClient,
     model: Model,
+    dispatcher: Option<Arc<Dispatcher>>,
+}
+
+impl std::fmt::Debug for AiClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AiClient")
+            .field("model", &self.model)
+            .field("dispatcher", &self.dispatcher.as_ref().map(|_| "<dispatcher>"))
+            .finish()
+    }
 }
 
 impl AiClient {
@@ -23,11 +36,21 @@ impl AiClient {
             .timeout(Duration::from_secs(300))
             .build()?;
 
-        Ok(Self { http, model })
+        Ok(Self { http, model, dispatcher: None })
     }
 
-    pub fn model(&self) -> &Model {
-        &self.model
+    /// 挂载 vendor dispatcher（feature gate / token 注入）。
+    ///
+    /// 挂载后 `chat_with_features` 会先调 `dispatcher.check()`，
+    /// `chat()` 仍走原路径（向后兼容）。
+    pub fn with_dispatcher(mut self, dispatcher: Arc<Dispatcher>) -> Self {
+        self.dispatcher = Some(dispatcher);
+        self
+    }
+
+    /// 拿当前 dispatcher（如有）
+    pub fn dispatcher(&self) -> Option<&Arc<Dispatcher>> {
+        self.dispatcher.as_ref()
     }
 
     // ── public API ─────────────────────────────────────────────────────
@@ -38,6 +61,24 @@ impl AiClient {
             ApiType::OpenAiCompletions => self.chat_openai(messages, params).await,
             ApiType::AnthropicMessages => self.chat_anthropic(messages, params).await,
         }
+    }
+
+    /// Send a non-streaming chat with explicit feature list (enables dispatcher check).
+    ///
+    /// 若挂载了 dispatcher 且 vendor 禁用了 `requested_features` 中的任一 feature，
+    /// 返 `Err(AiError::Other("vendor: ..."))`。
+    /// 未挂载 dispatcher 时等价于 `chat()`。
+    pub async fn chat_with_features(
+        &self,
+        messages: &[Message],
+        params: &GenerateParams,
+        requested_features: &HashSet<VendorFeature>,
+    ) -> Result<Completion> {
+        if let Some(d) = &self.dispatcher {
+            let vendor_id = VendorId::new(self.model.provider.clone());
+            d.check(&vendor_id, requested_features)?;
+        }
+        self.chat(messages, params).await
     }
 
     /// Send a streaming chat completion request.
