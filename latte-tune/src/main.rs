@@ -6,6 +6,8 @@ use colored::*;
 use latte_ai::models::{ApiType, Message, Model, Role, StreamEvent, TokenUsage};
 use latte_ai::params::GenerateParams;
 use latte_ai::AiClient;
+use latte_ai::vendor::{VendorId, VendorRegistry};
+use latte_ai::vendor_toml::registry_from_toml_str;
 use crate::report::UsageDisplay;
 
 mod prompts;
@@ -131,6 +133,28 @@ enum Commands {
         #[arg(short = 'r', long)]
         repl: bool,
     },
+    /// Manage vendor configs (list / status / refresh / discover)
+    Vendors {
+        #[command(subcommand)]
+        action: VendorsAction,
+
+        /// Config file (auto-discovered if not specified)
+        #[arg(long, global = true)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// `latte-tune vendors` 子命令的二级动作
+#[derive(Subcommand)]
+enum VendorsAction {
+    /// 列出所有 vendor
+    List,
+    /// 查看单个 vendor 的健康 + token 状态
+    Status { id: String },
+    /// 强制刷新 vendor token
+    Refresh { id: String },
+    /// 拉 vendor 的 model 列表
+    Discover { id: String },
 }
 
 #[tokio::main]
@@ -162,6 +186,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Chat { prompt, model, config, no_stream, repl } => {
             run_chat(prompt, model, config, no_stream, repl).await
         }
+        Commands::Vendors { action, config } => run_vendors(action, config).await,
     }
 }
 // ── Commands ───────────────────────────────────────────────────────────
@@ -799,4 +824,142 @@ fn xdg_config_path(ext: &str) -> PathBuf {
     } else {
         PathBuf::from(".config/latte").join(&filename)
     }
+}
+// ── Vendors 子命令 ─────────────────────────────────────────────────
+
+/// 加载 vendor registry：显式 --config → cwd `vendors.toml` → `~/.latte/vendors.toml`
+fn load_vendors_registry(config: Option<&std::path::Path>) -> anyhow::Result<VendorRegistry> {
+    use anyhow::Context;
+    let candidates: Vec<std::path::PathBuf> = match config {
+        Some(p) => vec![p.to_path_buf()],
+        None => {
+            let cwd = std::path::PathBuf::from("vendors.toml");
+            let home = std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".latte").join("vendors.toml"));
+            let mut v = vec![cwd];
+            if let Some(h) = home {
+                v.push(h);
+            }
+            v
+        }
+    };
+    for path in &candidates {
+        if path.exists() {
+            let s = std::fs::read_to_string(path)
+                .with_context(|| format!("read {}", path.display()))?;
+            return registry_from_toml_str(&s)
+                .with_context(|| format!("parse {}", path.display()));
+        }
+    }
+    anyhow::bail!(
+        "no vendors.toml found (tried: {})",
+        candidates
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// `latte-tune vendors` 入口
+async fn run_vendors(action: VendorsAction, config: Option<PathBuf>) -> anyhow::Result<()> {
+    let reg = load_vendors_registry(config.as_deref())?;
+    match action {
+        VendorsAction::List => vendors_print_list(&reg),
+        VendorsAction::Status { id } => vendors_print_status(&reg, &id).await,
+        VendorsAction::Refresh { id } => vendors_print_refresh(&reg, &id).await,
+        VendorsAction::Discover { id } => vendors_print_discover(&reg, &id).await,
+    }
+}
+
+fn vendors_print_list(reg: &VendorRegistry) -> anyhow::Result<()> {
+    let vendors = reg.list();
+    if vendors.is_empty() {
+        println!("{}", "No vendors configured.".yellow());
+        return Ok(());
+    }
+    println!("{}", format!("Configured vendors ({}):", vendors.len()).bold());
+    for v in vendors {
+        let disabled = if v.disabled_features.is_empty() {
+            "-".dimmed().to_string()
+        } else {
+            v.disabled_features
+                .iter()
+                .map(|f| format!("{:?}", f).to_lowercase())
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        println!(
+            "  {} {} {} disabled=[{}]",
+            v.id.as_str().green().bold(),
+            v.base_url.dimmed(),
+            v.auth.kind().cyan(),
+            disabled
+        );
+    }
+    Ok(())
+}
+
+async fn vendors_print_status(reg: &VendorRegistry, id: &str) -> anyhow::Result<()> {
+    let vid = VendorId::new(id);
+    let s = reg
+        .status(&vid)
+        .await
+        .map_err(|e| anyhow::anyhow!("status({id}) failed: {e}"))?;
+    let token_remaining = match s.token_remaining_secs {
+        Some(secs) => format!("{secs}s"),
+        None => "never expires".to_string(),
+    };
+    let health_latency = match s.health_latency_ms {
+        Some(ms) => format!("{ms}ms"),
+        None => "n/a".to_string(),
+    };
+    println!("{}", format!("Vendor: {}", s.vendor.as_str()).bold());
+    println!("  auth_kind:    {}", s.auth_kind.cyan());
+    println!("  auth_valid:   {}", if s.auth_valid { "yes".green() } else { "no".red() });
+    println!("  token_left:   {token_remaining}");
+    println!("  health:       {} ({})", if s.health_ok { "ok".green() } else { "fail".red() }, health_latency);
+    if let Some(n) = s.discovered_models {
+        println!("  models:       {n}");
+    }
+    Ok(())
+}
+
+async fn vendors_print_refresh(reg: &VendorRegistry, id: &str) -> anyhow::Result<()> {
+    let vid = VendorId::new(id);
+    let token = reg
+        .refresh_now(&vid)
+        .await
+        .map_err(|e| anyhow::anyhow!("refresh({id}) failed: {e}"))?;
+    let masked = if token.len() > 8 {
+        format!("{}…{}", &token[..4], &token[token.len() - 4..])
+    } else {
+        token.clone()
+    };
+    println!("{} refreshed token: {}", "✓".green(), masked.cyan());
+    Ok(())
+}
+
+async fn vendors_print_discover(reg: &VendorRegistry, id: &str) -> anyhow::Result<()> {
+    let vid = VendorId::new(id);
+    let models = reg
+        .discover_models(&vid)
+        .await
+        .map_err(|e| anyhow::anyhow!("discover({id}) failed: {e}"))?;
+    if models.is_empty() {
+        println!("{}", "No models discovered.".yellow());
+        return Ok(());
+    }
+    println!(
+        "{}",
+        format!("Discovered {} model(s) from {}:", models.len(), id).bold()
+    );
+    for m in &models {
+        let ctx = match m.context_window {
+            Some(c) => format!("ctx={c}"),
+            None => "-".to_string(),
+        };
+        println!("  {} {} {}", m.id.green(), m.display_name.dimmed(), ctx.dimmed());
+    }
+    Ok(())
 }
