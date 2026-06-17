@@ -36,3 +36,11 @@ clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 colored = "2"
+async-trait = "0.1"
+parking_lot = "0.12"
+tiktoken-rs = "0.7"
+ratatui = "0.29"
+crossterm = "0.28"
+rustyline = "14"
+prometheus = "0.13"
+axum = "0.8"
