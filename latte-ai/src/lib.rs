@@ -43,6 +43,7 @@ pub mod error;
 pub mod models;
 pub mod params;
 pub mod vendor;
+pub mod vendor_toml;
 pub use client::AiClient;
 pub use error::{AiError, Result};
 pub use models::*;
