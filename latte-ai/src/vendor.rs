@@ -19,27 +19,20 @@
 //!
 //! # 用法
 //!
-//! ```no_run
+//! ```rust
 //! use std::sync::Arc;
 //! use latte_ai::vendor::{
-//!     ApiKeyProvider, AnthropicModelsApi, VendorConfig, VendorId, VendorRegistry,
+//!     ApiKeyProvider, ModelDescriptor, VendorConfig, VendorId, VendorRegistry,
+//!     discover::Manual,
 //! };
 //!
-//! # async fn example() -> Result<(), latte_ai::vendor::VendorError> {
-//! let reg = VendorRegistry::new(vec![
-//!     VendorConfig::new(
-//!         VendorId::new("anthropic"),
-//!         "https://api.anthropic.com",
-//!         Arc::new(ApiKeyProvider::new("anthropic", "${ANTHROPIC_API_KEY}")),
-//!         Arc::new(AnthropicModelsApi),
-//!     ),
-//! ]);
-//!
-//! let token = reg.get_token(&VendorId::new("anthropic")).await?;
-//! let status = reg.status(&VendorId::new("anthropic")).await?;
-//! let models = reg.discover_models(&VendorId::new("anthropic")).await?;
-//! # Ok(())
-//! # }
+//! let discovery: Arc<dyn latte_ai::vendor::ModelDiscovery> = Arc::new(Manual(vec![
+//!     ModelDescriptor::new("gpt-4o", "GPT-4o"),
+//! ]));
+//! let auth: Arc<dyn latte_ai::vendor::TokenProvider> =
+//!     Arc::new(ApiKeyProvider::new("test", "k"));
+//! let v = VendorConfig::new("test", "https://api.x", auth, discovery);
+//! let _reg = VendorRegistry::new(vec![v]);
 //! ```
 
 use std::collections::{HashMap, HashSet};
