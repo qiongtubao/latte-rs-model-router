@@ -1,17 +1,15 @@
-//! 厂商抽象：VendorId + TokenProvider trait + ApiKey/Bearer 两个实现
+//! 厂商抽象：VendorId + TokenProvider + ModelDiscovery
 //!
-//! # Session 1 范围
+//! # Session 2 范围
 //!
-//! 本 session 只做「TokenProvider 抽象 + 两个 impl」：
-//! - `VendorId` newtype（防字符串拼写错误）
+//! - `VendorId` newtype
 //! - `VendorError` 错误类型
-//! - [`TokenProvider`] trait：`token()` / `refresh_now()` / `is_expired()`
-//! - [`ApiKeyProvider`]：静态 key，env 替换 (`${ENV_VAR}`)
-//! - [`BearerProvider`]：固定间隔自动刷新（started_at + interval + refresh 回调）
+//! - [`TokenProvider`] trait + [`ApiKeyProvider`] / [`BearerProvider`] impl
+//! - [`ModelDescriptor`] 轻量结构
+//! - [`ModelDiscovery`] trait + [`discover::AnthropicModelsApi`] / [`discover::OpenAiModelsApi`] impl
 //!
 //! # 后续 sessions（不在本 session 范围）
 //!
-//! - Session 2: ModelDiscovery trait + Anthropic / OpenAI discover impl
 //! - Session 3: VendorRegistry + config 解析（V1/V2 兼容）
 //! - Session 4: 单测 + examples
 //!
@@ -33,10 +31,16 @@
 //! );
 //! let bearer = BearerProvider::new("anthropic", "initial-token", refresher);
 //! let token = bearer.token().await?;
+//!
+//! // Discover models
+//! use latte_ai::vendor::{ModelDiscovery, discover::AnthropicModelsApi};
+//! let discover = AnthropicModelsApi;
+//! let models = discover.discover("https://api.anthropic.com", &token).await?;
 //! # Ok(())
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -95,6 +99,8 @@ fn resolve_env(s: &str) -> String {
     }
 }
 
+// ─── TokenProvider trait ─────────────────────────────────────
+
 /// Token 抽象接口
 ///
 /// 实现要求：
@@ -122,7 +128,7 @@ pub trait TokenProvider: Send + Sync {
     fn kind(&self) -> &'static str;
 }
 
-// ─── ApiKeyProvider（无刷新） ─────────────────────────────────
+// ─── ApiKeyProvider（无刷新） ───────────────────────────────
 
 /// 静态 API key provider
 ///
@@ -167,7 +173,7 @@ impl TokenProvider for ApiKeyProvider {
     }
 }
 
-// ─── BearerProvider（固定间隔自动刷新） ─────────────────────
+// ─── BearerProvider（固定间隔自动刷新） ───────────────────
 
 /// 内部 state（`RwLock` 允许 refresh 时更新）
 #[derive(Debug)]
@@ -360,9 +366,206 @@ pub mod bearer {
     }
 }
 
+// ─── ModelDescriptor（discover 结果） ────────────────────────
+
+/// 轻量模型描述符（discover API 返回的）
+///
+/// 与 `Model` 区别：不含 pricing / context_window 默认值等（vendor API 通常不返回这些）
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelDescriptor {
+    /// Model ID（如 `"claude-sonnet-4-20250514"` / `"gpt-4o"`）
+    pub id: String,
+    /// 人类可读名（如 `"Claude Sonnet 4"` / `"GPT-4o"`）
+    pub display_name: String,
+    /// Context window（vendor API 给的话就有）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
+    /// Vendor 特定元数据（Anthropic `display_name`、OpenAI `owned_by` 等）
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub vendor_specific: HashMap<String, String>,
+}
+
+impl ModelDescriptor {
+    pub fn new(id: impl Into<String>, display_name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            display_name: display_name.into(),
+            context_window: None,
+            vendor_specific: HashMap::new(),
+        }
+    }
+}
+
+/// 模型发现策略（用户可实现 trait 接入自建 vendor）
+#[async_trait]
+pub trait ModelDiscovery: Send + Sync {
+    /// Vendor 协议名（用于 metrics / 调试）
+    fn protocol(&self) -> &'static str;
+
+    /// 从 vendor API 拉所有可用 model
+    ///
+    /// `base_url`: vendor 的 API base URL（无尾斜杠）
+    /// `auth_token`: 通过 `TokenProvider::token()` 拿到的当前有效 token
+    async fn discover(
+        &self,
+        base_url: &str,
+        auth_token: &str,
+    ) -> VendorResult<Vec<ModelDescriptor>>;
+}
+
+// ─── 内置 discover impls ────────────────────────────────────
+
+/// Model 发现策略（Anthropic + OpenAI 等内置）
+pub mod discover {
+    use super::*;
+
+    /// Anthropic models API: `GET /v1/models`，返 `{data: [{id, display_name, ...}]}`
+    pub struct AnthropicModelsApi;
+
+    #[async_trait]
+    impl ModelDiscovery for AnthropicModelsApi {
+        fn protocol(&self) -> &'static str {
+            "anthropic"
+        }
+
+        async fn discover(
+            &self,
+            base_url: &str,
+            auth_token: &str,
+        ) -> VendorResult<Vec<ModelDescriptor>> {
+            let url = format!("{}/v1/models?limit=100", base_url.trim_end_matches('/'));
+            let resp = reqwest::Client::new()
+                .get(&url)
+                .header("x-api-key", auth_token)
+                .header("anthropic-version", "2023-06-01")
+                .send()
+                .await
+                .map_err(|e| VendorError::Network(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(VendorError::Network(format!(
+                    "anthropic /v1/models returned {status}"
+                )));
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| VendorError::RefreshFailed(format!("json parse: {e}")))?;
+            let data = body
+                .get("data")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| VendorError::RefreshFailed("missing 'data' field".into()))?;
+            data.iter()
+                .map(|m| {
+                    let id = m
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| VendorError::RefreshFailed("missing 'id'".into()))?
+                        .to_string();
+                    let display_name = m
+                        .get("display_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&id)
+                        .to_string();
+                    let mut specific = HashMap::new();
+                    if let Some(typ) = m.get("type").and_then(|v| v.as_str()) {
+                        specific.insert("type".to_string(), typ.to_string());
+                    }
+                    Ok(ModelDescriptor {
+                        id,
+                        display_name,
+                        context_window: None, // Anthropic API 不返回
+                        vendor_specific: specific,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    /// OpenAI models API: `GET /v1/models`，返 `{data: [{id, owned_by, ...}]}`
+    pub struct OpenAiModelsApi;
+
+    #[async_trait]
+    impl ModelDiscovery for OpenAiModelsApi {
+        fn protocol(&self) -> &'static str {
+            "openai"
+        }
+
+        async fn discover(
+            &self,
+            base_url: &str,
+            auth_token: &str,
+        ) -> VendorResult<Vec<ModelDescriptor>> {
+            let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+            let resp = reqwest::Client::new()
+                .get(&url)
+                .bearer_auth(auth_token)
+                .send()
+                .await
+                .map_err(|e| VendorError::Network(e.to_string()))?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(VendorError::Network(format!(
+                    "openai /v1/models returned {status}"
+                )));
+            }
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| VendorError::RefreshFailed(format!("json parse: {e}")))?;
+            let data = body
+                .get("data")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| VendorError::RefreshFailed("missing 'data' field".into()))?;
+            data.iter()
+                .map(|m| {
+                    let id = m
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| VendorError::RefreshFailed("missing 'id'".into()))?
+                        .to_string();
+                    let owned_by = m
+                        .get("owned_by")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("openai")
+                        .to_string();
+                    let mut specific = HashMap::new();
+                    specific.insert("owned_by".to_string(), owned_by);
+                    Ok(ModelDescriptor {
+                        id: id.clone(),
+                        display_name: id, // OpenAI 不给 display_name，用 id
+                        context_window: None, // OpenAI API 不返回
+                        vendor_specific: specific,
+                    })
+                })
+                .collect()
+        }
+    }
+
+    /// 静态列表（用户手填 / 兜底）
+    pub struct Manual(pub Vec<ModelDescriptor>);
+
+    #[async_trait]
+    impl ModelDiscovery for Manual {
+        fn protocol(&self) -> &'static str {
+            "manual"
+        }
+
+        async fn discover(
+            &self,
+            _base_url: &str,
+            _auth_token: &str,
+        ) -> VendorResult<Vec<ModelDescriptor>> {
+            Ok(self.0.clone())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::bearer::FixedIntervalRefresher;
+    use super::discover::{AnthropicModelsApi, Manual as ManualDiscover, OpenAiModelsApi};
     use std::time::Duration;
 
     // ── VendorId ─────────────────────────────────────────────
@@ -410,8 +613,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_provider_returns_initial_token_when_not_expired() {
-        // 起始时间 = now，interval = 1 小时 → 未过期
-        let refresher = bearer::FixedIntervalRefresher::new(
+        let refresher = FixedIntervalRefresher::new(
             Duration::from_secs(3600),
             || Box::pin(async { Ok("new-token".into()) }),
         );
@@ -423,9 +625,8 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_provider_refreshes_when_expired() {
-        // 起始 = 2 分钟前，interval = 1 分钟 → 已过期
         let started_at = Instant::now() - Duration::from_secs(120);
-        let refresher = bearer::FixedIntervalRefresher::with_started_at(
+        let refresher = FixedIntervalRefresher::with_started_at(
             started_at,
             Duration::from_secs(60),
             || Box::pin(async { Ok("new-token".into()) }),
@@ -440,20 +641,16 @@ mod tests {
         assert!(p.is_expired());
         let token = p.token().await.unwrap();
         assert_eq!(token, "new-token");
-        // refresh 后未过期
         assert!(!p.is_expired());
     }
 
     #[tokio::test]
     async fn bearer_provider_refresh_now_forces_refresh() {
-        // 起始 = now，interval = 1 小时 → 未过期
-        let refresher = bearer::FixedIntervalRefresher::new(
+        let refresher = FixedIntervalRefresher::new(
             Duration::from_secs(3600),
             || Box::pin(async { Ok("forced-new".into()) }),
         );
         let p = BearerProvider::new("anthropic", "initial", Duration::from_secs(3600), refresher);
-        assert!(!p.is_expired());
-        // 强制 refresh
         assert!(!p.is_expired());
         // 强制 refresh — 调 refresh_now（不走 token() 的过期判断）
         let token = p.refresh_now().await.unwrap();
@@ -462,8 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn bearer_provider_refresh_failure_propagates() {
-        // interval = 0 → 立即过期
-        let refresher = bearer::FixedIntervalRefresher::new(
+        let refresher = FixedIntervalRefresher::new(
             Duration::from_secs(0),
             || Box::pin(async {
                 Err(VendorError::RefreshFailed("token endpoint 503".into()))
@@ -476,8 +672,7 @@ mod tests {
 
     #[test]
     fn bearer_provider_remaining_seconds() {
-        // interval = 1 小时，age = 0 → remaining 接近 1 小时
-        let refresher = bearer::FixedIntervalRefresher::new(
+        let refresher = FixedIntervalRefresher::new(
             Duration::from_secs(3600),
             || Box::pin(async { Ok("t".into()) }),
         );
@@ -485,5 +680,47 @@ mod tests {
         let remaining = p.remaining();
         assert!(remaining > Duration::from_secs(3599));
         assert!(remaining <= Duration::from_secs(3600));
+    }
+
+    // ── ModelDescriptor ────────────────────────────────────
+
+    #[test]
+    fn model_descriptor_new_works() {
+        let d = ModelDescriptor::new("gpt-4o", "GPT-4o");
+        assert_eq!(d.id, "gpt-4o");
+        assert_eq!(d.display_name, "GPT-4o");
+        assert!(d.context_window.is_none());
+        assert!(d.vendor_specific.is_empty());
+    }
+
+    #[test]
+    fn model_descriptor_serde_roundtrip() {
+        let mut d = ModelDescriptor::new("claude-sonnet-4", "Claude Sonnet 4");
+        d.context_window = Some(200_000);
+        d.vendor_specific.insert("type".into(), "model".into());
+        let json = serde_json::to_string(&d).unwrap();
+        let back: ModelDescriptor = serde_json::from_str(&json).unwrap();
+        assert_eq!(d, back);
+    }
+
+    // ── ModelDiscovery impls（Manual 不打网络）────────────
+
+    #[tokio::test]
+    async fn manual_discover_returns_preset_models() {
+        let models = vec![
+            ModelDescriptor::new("gpt-4o", "GPT-4o"),
+            ModelDescriptor::new("gpt-4o-mini", "GPT-4o Mini"),
+        ];
+        let discover = ManualDiscover(models.clone());
+        let result = discover.discover("ignored", "ignored").await.unwrap();
+        assert_eq!(result, models);
+        assert_eq!(discover.protocol(), "manual");
+    }
+
+    #[test]
+    fn discovery_protocols() {
+        assert_eq!(AnthropicModelsApi.protocol(), "anthropic");
+        assert_eq!(OpenAiModelsApi.protocol(), "openai");
+        assert_eq!(ManualDiscover(vec![]).protocol(), "manual");
     }
 }
