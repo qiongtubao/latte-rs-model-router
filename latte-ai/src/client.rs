@@ -34,6 +34,7 @@ impl AiClient {
 
     /// Send a non-streaming chat completion request.
     pub async fn chat(&self, messages: &[Message], params: &GenerateParams) -> Result<Completion> {
+        self.check_api_key()?;
         match self.model.api {
             ApiType::OpenAiCompletions => self.chat_openai(messages, params).await,
             ApiType::AnthropicMessages => self.chat_anthropic(messages, params).await,
@@ -48,10 +49,28 @@ impl AiClient {
         messages: &[Message],
         params: &GenerateParams,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamEvent>> {
+        self.check_api_key()?;
         match self.model.api {
             ApiType::OpenAiCompletions => self.stream_openai(messages, params).await,
             ApiType::AnthropicMessages => self.stream_anthropic(messages, params).await,
         }
+    }
+
+    /// Reject calls when the resolved `api_key` is blank. Without this guard the
+    /// HTTP client would send an empty `Authorization: Bearer ` / `x-api-key: `
+    /// header and the vendor would reject the request with a 401 — which is a
+    /// configuration mistake on the caller side, not a transient failure.
+    fn check_api_key(&self) -> Result<()> {
+        if self.model.api_key.trim().is_empty() {
+            return Err(AiError::Config(format!(
+                "model '{}' has no api_key configured; set it in your global \
+                 config (~/.latte/models.yaml), project config \
+                 (config/models.toml), --api-key flag, or the corresponding \
+                 ${{ENV_VAR}} in api_key",
+                self.model.id
+            )));
+        }
+        Ok(())
     }
 
     // ── OpenAI chat completions (non-streaming) ─────────────────────────
@@ -68,7 +87,6 @@ impl AiClient {
 
         let req = self.build_openai_request(messages, params, false);
         debug!(url, model = %req.model, "OpenAI request");
-
         let resp = self.http
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.model.api_key))
@@ -481,3 +499,70 @@ impl AiClient {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{ApiType, Message, Role};
+
+    fn model_with_key(api: ApiType, key: &str) -> Model {
+        Model {
+            id: "test-model".into(),
+            name: "Test Model".into(),
+            api,
+            provider: "test".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            api_key: key.into(),
+            context_window: 1024,
+            max_tokens: 256,
+            supports_thinking: false,
+            cost_per_million_input: 0.0,
+            cost_per_million_output: 0.0,
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_openai_blank_api_key_fails_fast() {
+        let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "")).unwrap();
+        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let params = GenerateParams::default();
+        let err = client.chat(&msg, &params).await.unwrap_err();
+        match err {
+            AiError::Config(m) => assert!(m.contains("test-model"), "got: {m}"),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_anthropic_blank_api_key_fails_fast() {
+        // Regression: previously the request fired with an empty `x-api-key`
+        // header and the vendor returned "x-api-key header is required".
+        let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "")).unwrap();
+        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let params = GenerateParams::default();
+        let err = client.chat(&msg, &params).await.unwrap_err();
+        match err {
+            AiError::Config(m) => assert!(m.contains("test-model"), "got: {m}"),
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_whitespace_only_api_key_fails_fast() {
+        let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "   ")).unwrap();
+        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let params = GenerateParams::default();
+        let err = client.chat(&msg, &params).await.unwrap_err();
+        assert!(matches!(err, AiError::Config(_)));
+    }
+
+    #[tokio::test]
+    async fn chat_stream_blank_api_key_fails_fast() {
+        let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "")).unwrap();
+        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let params = GenerateParams::default();
+        let err = client.chat_stream(&msg, &params).await.unwrap_err();
+        assert!(matches!(err, AiError::Config(_)));
+    }
+}
+
