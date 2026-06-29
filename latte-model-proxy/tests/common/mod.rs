@@ -22,6 +22,9 @@ pub fn make_entry(id: &str, api: ApiType, base_url: String) -> ModelEntry {
         rate_limit_refresh_interval_secs: 60,
         retry_count_5xx: 5,
         cooldown_5xx_secs: 600,
+        retry_on: vec![403],
+        retry_on_count: 10,
+        retry_on_cooldown_secs: 600,
     }
 }
 

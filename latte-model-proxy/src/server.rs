@@ -453,244 +453,239 @@ async fn forward_passthrough(
         }
     };
 
-    let route: Route = if model == state.proxy_default_model {
-        debug!(
-            target: "latte_model_proxy",
-            request_id = %request_id,
-            pool_size = state.pool.len(),
-            "silent selection (proxy-default)"
-        );
-        match state.router.select_candidates(&state.pool) {
-            Ok(r) => {
-                info!(
-                    target: "latte_model_proxy",
-                    request_id = %request_id,
-                    selected_model = %r.model_id,
-                    "silent selection picked"
-                );
-                r
-            }
-            Err(RouterError::AllUnavailable { retry_after_secs }) => {
-                warn!(
-                    target: "latte_model_proxy",
-                    request_id = %request_id,
-                    retry_after_secs = retry_after_secs,
-                    "silent selection: all candidates in cooldown (503)"
-                );
-                let mut resp = json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "all upstream models in cooldown".into(),
-                );
-                if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                    resp.headers_mut().insert(header::RETRY_AFTER, v);
-                }
-                return resp;
-            }
-            Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("router: {e}"),
-                );
-            }
-        }
-    } else {
-        match state.router.select(&model) {
-            Ok(r) => r,
-            Err(RouterError::UnknownModel(_)) => {
-                warn!(
-                    target: "latte_model_proxy",
-                    request_id = %request_id,
-                    requested = %model,
-                    "model not in pool (404)"
-                );
-                return json_error(
-                    StatusCode::NOT_FOUND,
-                    format!("model '{model}' not served"),
-                );
-            }
-            Err(RouterError::AllUnavailable { retry_after_secs }) => {
-                warn!(
-                    target: "latte_model_proxy",
-                    request_id = %request_id,
-                    requested = %model,
-                    retry_after_secs = retry_after_secs,
-                    "all upstream in cooldown (503)"
-                );
-                let mut resp = json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "all upstream models in cooldown".into(),
-                );
-                if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
-                    resp.headers_mut().insert(header::RETRY_AFTER, v);
-                }
-                return resp;
-            }
-            Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("router: {e}"),
-                );
-            }
-        }
-    };
+    let model_is_proxy_default = model == state.proxy_default_model;
+    let mut body_to_send = parsed;
 
-    if route.api != expected_api {
-        warn!(
+    loop {
+        // --- 1. Select route ---
+        let route: Route = if model_is_proxy_default {
+            match state.router.select_candidates(&state.pool) {
+                Ok(r) => r,
+                Err(RouterError::AllUnavailable { retry_after_secs }) => {
+                    warn!(
+                        target: "latte_model_proxy",
+                        request_id = %request_id,
+                        retry_after_secs = retry_after_secs,
+                        "all candidates in cooldown (503)"
+                    );
+                    let mut resp = json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "all upstream models in cooldown".into(),
+                    );
+                    if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                        resp.headers_mut().insert(header::RETRY_AFTER, v);
+                    }
+                    return resp;
+                }
+                Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("router: {e}")),
+            }
+        } else {
+            match state.router.select(&model) {
+                Ok(r) => r,
+                Err(RouterError::UnknownModel(_)) => {
+                    return json_error(StatusCode::NOT_FOUND, format!("model '{model}' not served"));
+                }
+                Err(RouterError::AllUnavailable { retry_after_secs }) => {
+                    let mut resp = json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "all upstream models in cooldown".into(),
+                    );
+                    if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                        resp.headers_mut().insert(header::RETRY_AFTER, v);
+                    }
+                    return resp;
+                }
+                Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("router: {e}")),
+            }
+        };
+
+        if route.api != expected_api {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "model '{}' is served via {:?}, not the requested API shape",
+                    route.model_id, route.api
+                ),
+            );
+        }
+
+        // --- 2. Prepare body ---
+        if model_is_proxy_default {
+            if let Some(obj) = body_to_send.as_object_mut() {
+                obj.insert("model".to_string(), json!(route.model_id.clone()));
+            }
+        }
+
+        let stream_flag = body_to_send
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let upstream_url = format!(
+            "{}/{}",
+            route.base_url.trim_end_matches('/'),
+            url_suffix.trim_start_matches('/')
+        );
+
+        info!(
             target: "latte_model_proxy",
             request_id = %request_id,
             requested = %model,
             selected_model = %route.model_id,
-            expected = ?expected_api,
-            actual = ?route.api,
-            "api shape mismatch (400)"
+            upstream_url = %upstream_url,
+            stream = stream_flag,
+            body_model_replaced = model_is_proxy_default,
+            "forwarding to upstream"
         );
-        return json_error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "model '{model}' is served via {:?}, not the requested API shape",
-                route.api
-            ),
-        );
-    }
 
-    let mut body_to_send = parsed;
-    if model == state.proxy_default_model {
-        if let Some(obj) = body_to_send.as_object_mut() {
-            obj.insert("model".to_string(), json!(route.model_id.clone()));
+        // --- 3. Send request ---
+        let req = state
+            .http
+            .post(&upstream_url)
+            .header("content-type", "application/json");
+        let req = auth_header(req, &route.api_key);
+
+        let resp = match req.json(&body_to_send).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    target: "latte_model_proxy",
+                    request_id = %request_id,
+                    selected_model = %route.model_id,
+                    upstream_url = %upstream_url,
+                    error = %e,
+                    "upstream network error"
+                );
+                return json_error(
+                    StatusCode::BAD_GATEWAY,
+                    format!("upstream network error: {e}"),
+                );
+            }
+        };
+
+        let status = resp.status();
+        let retry_after_secs = parse_retry_after_header(resp.headers());
+        let ctype = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+
+        // --- 4. Handle streaming ---
+        if stream_flag {
+            state.router.record(&route.model_id, status.as_u16(), retry_after_secs);
+            let mut out = Response::new(Body::from_stream(resp.bytes_stream()));
+            *out.status_mut() =
+                StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            if let Ok(ct) = HeaderValue::from_str(&ctype) {
+                out.headers_mut().insert(header::CONTENT_TYPE, ct);
+            }
+            if let Some(ra) = retry_after_secs {
+                if let Ok(v) = HeaderValue::from_str(&ra.to_string()) {
+                    out.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+            }
+            return out;
         }
-    }
 
-    let stream_flag = body_to_send
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        // --- 5. Read body ---
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                return json_error(StatusCode::BAD_GATEWAY, format!("upstream body read: {e}"));
+            }
+        };
 
-    let upstream_url = format!(
-        "{}/{}",
-        route.base_url.trim_end_matches('/'),
-        url_suffix.trim_start_matches('/')
-    );
+        let response_status = status.as_u16();
+        let duration_ms = start.elapsed().as_millis() as u64;
+        // --- 6. 403 transparent retry (proxy-default only, exclude current) ---
+        if response_status == 403 && model_is_proxy_default {
+            // record in breaker first (counts consecutive 403s, pulls out
+            // after retry_count_403 consecutive failures)
+            state.router.record(&route.model_id, response_status, retry_after_secs);
 
-    info!(
-        target: "latte_model_proxy",
-        request_id = %request_id,
-        requested = %model,
-        selected_model = %route.model_id,
-        upstream_url = %upstream_url,
-        stream = stream_flag,
-        body_model_replaced = (model == state.proxy_default_model),
-        "forwarding to upstream"
-    );
-
-    let req = state
-        .http
-        .post(&upstream_url)
-        .header("content-type", "application/json");
-    let req = auth_header(req, &route.api_key);
-
-    let resp = match req.json(&body_to_send).send().await {
-        Ok(r) => r,
-        Err(e) => {
             warn!(
                 target: "latte_model_proxy",
                 request_id = %request_id,
                 selected_model = %route.model_id,
-                upstream_url = %upstream_url,
-                error = %e,
-                "upstream network error"
+                "403 from upstream, trying next pool member"
             );
-            return json_error(
-                StatusCode::BAD_GATEWAY,
-                format!("upstream network error: {e}"),
+
+            // exclude current model from pool and try again
+            let filtered_pool: Vec<String> = state.pool.iter()
+                .filter(|m| *m != &route.model_id)
+                .cloned()
+                .collect();
+
+            match state.router.select_candidates(&filtered_pool) {
+                Ok(next_route) => {
+                    // inject next route directly into body
+                    if let Some(obj) = body_to_send.as_object_mut() {
+                        obj.insert("model".to_string(), json!(next_route.model_id.clone()));
+                    }
+                    info!(
+                        target: "latte_model_proxy",
+                        request_id = %request_id,
+                        fallback_to = %next_route.model_id,
+                        "transparent fallback after 403"
+                    );
+                    continue;
+                }
+                Err(RouterError::AllUnavailable { retry_after_secs }) => {
+                    warn!(
+                        target: "latte_model_proxy",
+                        request_id = %request_id,
+                        retry_after_secs = retry_after_secs,
+                        "all upstream models exhausted after 403 (503)"
+                    );
+                    let mut resp = json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "all upstream models exhausted after quota error".into(),
+                    );
+                    if let Ok(v) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+                        resp.headers_mut().insert(header::RETRY_AFTER, v);
+                    }
+                    return resp;
+                }
+                Err(e) => return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("router retry after 403: {e}"),
+                ),
+            }
+        }
+
+        // --- 7. Log + return ---
+        if status.is_success() {
+            info!(
+                target: "latte_model_proxy",
+                request_id = %request_id,
+                selected_model = %route.model_id,
+                status = response_status,
+                duration_ms = duration_ms,
+                body_bytes = bytes.len(),
+                "upstream response OK"
+            );
+        } else {
+            warn!(
+                target: "latte_model_proxy",
+                request_id = %request_id,
+                selected_model = %route.model_id,
+                status = response_status,
+                duration_ms = duration_ms,
+                body_bytes = bytes.len(),
+                retry_after_header = retry_after_secs.unwrap_or(0),
+                "upstream non-2xx"
             );
         }
-    };
 
-    let status = resp.status();
-    let retry_after_secs = parse_retry_after_header(resp.headers());
-    let ctype = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-
-    if stream_flag {
-        let response_status = status.as_u16();
-        state
-            .router
-            .record(&route.model_id, response_status, retry_after_secs);
-        info!(
-            target: "latte_model_proxy",
-            request_id = %request_id,
-            selected_model = %route.model_id,
-            status = response_status,
-            content_type = %ctype,
-            "streaming response started"
-        );
-        let mut out = Response::new(Body::from_stream(resp.bytes_stream()));
-        *out.status_mut() =
-            StatusCode::from_u16(response_status).unwrap_or(StatusCode::BAD_GATEWAY);
+        let mut out = Response::new(Body::from(bytes));
+        *out.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
         if let Ok(ct) = HeaderValue::from_str(&ctype) {
             out.headers_mut().insert(header::CONTENT_TYPE, ct);
         }
-        if let Some(ra) = retry_after_secs {
-            if let Ok(v) = HeaderValue::from_str(&ra.to_string()) {
-                out.headers_mut().insert(header::RETRY_AFTER, v);
-            }
-        }
         return out;
     }
-
-    let bytes = match resp.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(
-                target: "latte_model_proxy",
-                request_id = %request_id,
-                selected_model = %route.model_id,
-                error = %e,
-                "upstream body read failed"
-            );
-            return json_error(StatusCode::BAD_GATEWAY, format!("upstream body read: {e}"));
-        }
-    };
-
-    let duration_ms = start.elapsed().as_millis() as u64;
-    let response_status = status.as_u16();
-    state
-        .router
-        .record(&route.model_id, response_status, retry_after_secs);
-
-    if status.is_success() {
-        info!(
-            target: "latte_model_proxy",
-            request_id = %request_id,
-            selected_model = %route.model_id,
-            status = response_status,
-            duration_ms = duration_ms,
-            body_bytes = bytes.len(),
-            "upstream response OK"
-        );
-    } else {
-        warn!(
-            target: "latte_model_proxy",
-            request_id = %request_id,
-            selected_model = %route.model_id,
-            status = response_status,
-            duration_ms = duration_ms,
-            body_bytes = bytes.len(),
-            retry_after_header = retry_after_secs.unwrap_or(0),
-            "upstream non-2xx"
-        );
-    }
-
-    let mut out = Response::new(Body::from(bytes));
-    *out.status_mut() = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    if let Ok(ct) = HeaderValue::from_str(&ctype) {
-        out.headers_mut().insert(header::CONTENT_TYPE, ct);
-    }
-    out
 }
 
 fn parse_retry_after_header(headers: &reqwest::header::HeaderMap) -> Option<u64> {

@@ -169,9 +169,11 @@ impl Router {
     /// Record an upstream response for `model_id`. Updates the breaker:
     ///
     /// - `429`: pull model out until `max(breaker.next_refresh(now), now + retry_after)`
+    /// - `entry.retry_on` (e.g. `[403]`): count consecutive hits; if it reaches
+    ///   `entry.retry_on_count`, pull out for `entry.retry_on_cooldown_secs`
     /// - `5xx`: increment counter; if it reaches `entry.retry_count_5xx`, pull
     ///   out for `entry.cooldown_5xx_secs`
-    /// - other: reset the 5xx counter
+    /// - other: reset the 5xx and retry_on counters
     pub fn record(&self, model_id: &str, status: u16, retry_after_secs: Option<u64>) {
         let Some(entry) = self.pool.iter().find(|m| m.id == model_id) else {
             warn!(
@@ -183,7 +185,6 @@ impl Router {
             return;
         };
         let now = self.clock.now();
-
         if status == 429 {
             let computed = entry.next_refresh(now);
             let computed_secs = computed.timestamp();
@@ -201,6 +202,14 @@ impl Router {
                 "upstream 429, applying pull-out"
             );
             self.breaker.pull_out(model_id, until);
+        } else if entry.retry_on.contains(&status) {
+            self.breaker.record_retry_on(
+                model_id,
+                status,
+                entry.retry_on_count,
+                now,
+                entry.cooldown_retry_on(),
+            );
         } else if (500..600).contains(&status) {
             self.breaker
                 .record_5xx(model_id, entry.retry_count_5xx, now, entry.cooldown_5xx());
@@ -210,7 +219,7 @@ impl Router {
                 target: "latte_router",
                 model_id = %model_id,
                 status = status,
-                "upstream success/4xx (reset 5xx counter)"
+                "upstream success/4xx (reset counters)"
             );
         }
     }

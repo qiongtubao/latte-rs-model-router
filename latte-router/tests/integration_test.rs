@@ -52,6 +52,9 @@ fn make_entry(
         rate_limit_refresh_interval_secs: interval,
         retry_count_5xx: threshold,
         cooldown_5xx_secs: cooldown,
+        retry_on: vec![403],
+        retry_on_count: 10,
+        retry_on_cooldown_secs: 600,
     }
 }
 
@@ -177,6 +180,62 @@ fn all_pool_members_cooling_returns_all_unavailable_with_min_retry() {
     } else {
         panic!("expected AllUnavailable");
     }
+}
+
+#[test]
+fn record_403_below_threshold_does_not_pull_out() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    // retry_count_5xx=5 cooldown_5xx_secs=600
+    let a = make_entry("a", t0, 60, 5, 600);  // retry_count_403=10, cooldown_403_secs=600
+    let router = Router::new(vec![a], clock.clone());
+
+    // 9 consecutive 403s → below threshold, model still available
+    for _ in 0..9 {
+        router.record("a", 403, None);
+    }
+    assert!(router.select("a").is_ok());
+}
+
+#[test]
+fn record_403_after_threshold_pulls_out_model() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 5, 600);
+    let b = make_entry("b", t0, 60, 5, 600);
+    let router = Router::new(vec![a, b], clock.clone());
+
+    // 10 consecutive 403s → threshold reached (default=10), pull out
+    for _ in 0..10 {
+        router.record("a", 403, None);
+    }
+
+    // select("a") should fallback to b
+    let route = router.select("a").unwrap();
+    assert_eq!(route.model_id, "b");
+
+    // select_candidates also skips a
+    let route = router
+        .select_candidates(&["a".to_string(), "b".to_string()])
+        .unwrap();
+    assert_eq!(route.model_id, "b");
+}
+
+#[test]
+fn record_403_counter_resets_on_success() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 5, 600);
+    let router = Router::new(vec![a], clock.clone());
+
+    // 9 403s + 1 success → counter resets
+    for _ in 0..9 {
+        router.record("a", 403, None);
+    }
+    router.record("a", 200, None);  // resets counter
+    router.record("a", 403, None);  // should be count 1 again, not 10
+
+    assert!(router.select("a").is_ok());
 }
 
 #[test]

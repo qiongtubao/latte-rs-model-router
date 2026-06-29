@@ -14,6 +14,7 @@ use tracing::{debug, info};
 #[derive(Debug, Default, Clone, Copy)]
 struct VendorBreaker {
     consecutive_5xx: u32,
+    consecutive_403: u32,
     unavailable_until: Option<DateTime<Utc>>,
 }
 
@@ -47,6 +48,7 @@ impl CircuitBreaker {
         let entry = state.entry(model_id.to_string()).or_default();
         entry.unavailable_until = Some(until);
         entry.consecutive_5xx = 0;
+        entry.consecutive_403 = 0;
         drop(state);
         info!(
             target: "latte_router::breaker",
@@ -101,21 +103,79 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a success (or 4xx non-429). Resets the 5xx counter.
-    pub fn reset(&self, model_id: &str) {
-        let prev = {
+    /// Record a retry-eligible response (e.g. 403). Opens the breaker
+    /// when consecutive count hits `threshold`.
+    pub fn record_retry_on(
+        &self,
+        model_id: &str,
+        status: u16,
+        threshold: u32,
+        now: DateTime<Utc>,
+        cooldown: Duration,
+    ) {
+        enum RecordResult {
+            Opened { count: u32, until: DateTime<Utc> },
+            Counted { count: u32 },
+        }
+        let result = {
             let mut state = self.state.lock();
             let entry = state.entry(model_id.to_string()).or_default();
-            let prev = entry.consecutive_5xx;
-            entry.consecutive_5xx = 0;
-            prev
+            entry.consecutive_403 += 1;
+            if entry.consecutive_403 >= threshold {
+                let cd = chrono::Duration::from_std(cooldown).unwrap_or_default();
+                let until = now + cd;
+                entry.unavailable_until = Some(until);
+                let count = entry.consecutive_403;
+                entry.consecutive_403 = 0;
+                RecordResult::Opened { count, until }
+            } else {
+                RecordResult::Counted { count: entry.consecutive_403 }
+            }
         };
-        if prev > 0 {
+        match result {
+            RecordResult::Opened { count, until } => {
+                info!(
+                    target: "latte_router::breaker",
+                    model_id = %model_id,
+                    status = status,
+                    consecutive = count,
+                    threshold = threshold,
+                    cooldown_secs = cooldown.as_secs(),
+                    until = %until.to_rfc3339(),
+                    "retry-on breaker opened"
+                );
+            }
+            RecordResult::Counted { count } => {
+                debug!(
+                    target: "latte_router::breaker",
+                    model_id = %model_id,
+                    status = status,
+                    consecutive = count,
+                    threshold = threshold,
+                    "retry-on counted (below threshold)"
+                );
+            }
+        }
+    }
+
+    /// Record a success (or 4xx non-429). Resets the 5xx and 403 counters.
+    pub fn reset(&self, model_id: &str) {
+        let (prev_5xx, prev_403) = {
+            let mut state = self.state.lock();
+            let entry = state.entry(model_id.to_string()).or_default();
+            let p5 = entry.consecutive_5xx;
+            let p4 = entry.consecutive_403;
+            entry.consecutive_5xx = 0;
+            entry.consecutive_403 = 0;
+            (p5, p4)
+        };
+        if prev_5xx > 0 || prev_403 > 0 {
             debug!(
                 target: "latte_router::breaker",
                 model_id = %model_id,
-                previous_5xx = prev,
-                "5xx counter reset on success"
+                previous_5xx = prev_5xx,
+                previous_403 = prev_403,
+                "breaker counters reset on success"
             );
         }
     }

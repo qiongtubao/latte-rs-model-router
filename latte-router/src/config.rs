@@ -39,6 +39,17 @@ pub struct ModelEntry {
 
     #[serde(default = "default_srv_cooldown")]
     pub cooldown_5xx_secs: u64,
+
+    // 可重试的状态码：收到这些 code 后透明 fallback 到 pool 下一个 model
+    // 连续 retry_on_count 次后拉出 retry_on_cooldown_secs 秒
+    #[serde(default = "default_retry_on")]
+    pub retry_on: Vec<u16>,
+
+    #[serde(default = "default_retry_on_count")]
+    pub retry_on_count: u32,
+
+    #[serde(default = "default_retry_on_cooldown")]
+    pub retry_on_cooldown_secs: u64,
 }
 
 fn default_context_window() -> u32 {
@@ -52,6 +63,15 @@ fn default_rl_anchor() -> DateTime<Utc> {
 }
 fn default_rl_interval() -> u64 {
     60
+}
+fn default_retry_on() -> Vec<u16> {
+    vec![403]
+}
+fn default_retry_on_count() -> u32 {
+    10
+}
+fn default_retry_on_cooldown() -> u64 {
+    600 // 10 minutes
 }
 fn default_srv_threshold() -> u32 {
     5
@@ -89,6 +109,9 @@ impl ModelEntry {
     }
     pub fn cooldown_5xx(&self) -> Duration {
         Duration::from_secs(self.cooldown_5xx_secs)
+    }
+    pub fn cooldown_retry_on(&self) -> Duration {
+        Duration::from_secs(self.retry_on_cooldown_secs)
     }
 }
 

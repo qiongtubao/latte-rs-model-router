@@ -49,6 +49,9 @@ async fn server_with_one_entry_selects_that_model() {
         rate_limit_refresh_interval_secs: 60,
         retry_count_5xx: 5,
         cooldown_5xx_secs: 600,
+        retry_on: vec![403],
+        retry_on_count: 10,
+        retry_on_cooldown_secs: 600,
     };
     let server = Server::with_entries(vec![entry], "test".to_string());
 
