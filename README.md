@@ -27,10 +27,11 @@ latte-rs-model-router/
 │   ├── report.rs              # 结果格式化输出
 │   └── main.rs                # CLI 入口：sweep / list-models / list-prompts / compare / chat
 ├── latte-model-proxy/         # HTTP 代理（Ollama / OpenAI / Anthropic 兼容）
-│   ├── cli.rs                 # clap 参数定义（--config / --host / --port / --models / --models-dir）
-│   ├── server.rs              # axum 路由：/api/{tags,show,chat}、/v1/{models,chat/completions}、/v1/messages
-│   ├── main.rs                # 入口：latte-model-proxy --models=id1,id2 --port=6666
-│   └── tests/                 # 20 个集成测试（wiremock 模拟下游）
+│   ├── cli.rs                 # clap 参数定义（--config / --host / --port / --pool / --api-key / …）
+│   ├── server.rs              # axum 路由 + auth middleware + graceful shutdown
+│   ├── main.rs                # 入口：catalog loading + ServerRuntime + serve
+│   └── tests/                 # 52 个集成测试（wiremock 模拟下游）
+├── latte_project_debug/       # 本地专用最小 proxy 工作目录（proxy.toml + models.d/*.toml）
 └── README.md
 ```
 
@@ -880,18 +881,10 @@ models = ["claude-sonnet-4-20250514", "deepseek-v4-flash"]  # 数组顺序 = 权
 |---|---|---|---|
 | `server.host` | string | `127.0.0.1` | 绑定地址 |
 | `server.port` | u16 | `11434` | 监听端口 |
+| `server.api_key` | string 或空 | `""` | 可选。配置后 POST chat 端点必须带 `Authorization: Bearer <key>` |
 | `catalog.models_dir` | string | `~/.latte/models.d` | 模型定义目录；启动时同时找 `./.latte/models.d` 做项目级覆盖 |
-| `catalog.models` | array | `[]` | 暴露的 model id 列表；**数组顺序 = 优先级**（rank 0 首选，降级到 rank 1） |
-
-CLI flags（覆盖 proxy.toml）：
-
-| flag | 覆盖 |
-|---|---|
-| `--config <path>` | proxy.toml 路径 |
-| `--host <X>` | `server.host` |
-| `--port <N>` | `server.port` |
-| `--models id1,id2` | `catalog.models` |
-| `--models-dir <path>` | `catalog.models_dir` |
+| `catalog.proxy_default_model` | string | `"proxy-default"` | 客户端发这个 model 名时触发静默选路 |
+| `catalog.pool` | array | `[]` | 暴露的 model id 列表；**数组顺序 = 优先级**（rank 0 首选，降级到 rank 1）
 
 ### 6.2 模型定义（`models.d/*.toml`）
 
@@ -972,11 +965,11 @@ latte-model-proxy
 # 显式指定
 latte-model-proxy \
   --config ~/.latte/proxy.toml \
-  --models=claude-sonnet-4-20250514,deepseek-v4-flash \
+  --pool=claude-sonnet-4-20250514,deepseek-v4-flash \
   --port=6666
 ```
 
-省略 `--config`：自动找 `./proxy.toml` → `~/.latte/proxy.toml`。省略 `--models`：用 `proxy.toml` 的 `catalog.models`。都没给 → 启动失败。
+省略 `--config`：自动找 `./proxy.toml` → `~/.latte/proxy.toml`。省略 `--pool`：用 `proxy.toml` 的 `catalog.pool`。都没给 → 启动失败。
 
 ### 6.5 程序化使用
 
@@ -1006,7 +999,7 @@ catalog.load_dir("~/.latte/models.d")?;
 ## 7. 开发与测试
 
 ```bash
-# 全量测试（40 个）
+# 全量测试（52 个）
 cargo test --workspace
 
 # 单 crate
@@ -1024,33 +1017,50 @@ cargo build --workspace --release
 `latte-model-proxy` 是一个本地 HTTP 代理服务，把多个下游 AI 厂商聚合到一个端点上，
 客户端用 OpenAI / Anthropic / Ollama 任意一种 API shape 调用，本服务按
 请求里的 `model` 路由到对应的下游厂商。可作为 OpenAI SDK、Claude Code、
-Ollama 生态的统一入口。选路 + 限流冷却 + 5xx 熔断都委托给 `latte-router`。
+Ollama 生态的统一入口。
+
+选路 + 限流冷却 + 5xx 熔断都委托给 `latte-router`。
 
 ### 8.1 启动
 
 ```bash
-# 默认：自动找 ./proxy.toml → ~/.latte/proxy.toml，models 来自 proxy.toml
+# 默认：自动找 ./proxy.toml → ~/.latte/proxy.toml
 latte-model-proxy
 
-# 显式指定 model 列表（CLI 覆盖 proxy.toml）
-latte-model-proxy --models=claude-sonnet-4-20250514,deepseek-v4-flash --port=6666
+# 覆盖 config / host / port / pool / api‑key
+latte-model-proxy --config=./proxy.toml --port=6666 \
+  --pool=claude-sonnet-4,deepseek-v4-flash \
+  --api-key=mysecret
 ```
 
-### 8.2 完整示例
+### 8.2 `proxy.toml` 完整配置
 
-```bash
-# 1. 准备配置
-mkdir -p ~/.latte/models.d
-
-cat > ~/.latte/proxy.toml <<'EOF'
+```toml
 [server]
 host = "127.0.0.1"
 port = 11434
 
+# 可选。配置后 POST /v1/chat/completions、/v1/messages、/api/chat
+# 必须带 Authorization: Bearer <key>。其他路由永远公开。
+api_key = "mysecret"
+
 [catalog]
 models_dir = "~/.latte/models.d"
-models = ["claude-sonnet-4-20250514", "deepseek-v4-flash"]
-EOF
+
+# 客户端发送 model = "proxy-default" 时触发静默认选。
+# 代理按 pool 顺序找第一个可用的物理 model。
+proxy_default_model = "proxy-default"
+
+# 优先级池。顺序 = 权重，第一个最高。
+# client 发 model = proxy_default_model 时才用到这个池。
+pool = ["claude-sonnet-4-20250514", "deepseek-v4-flash", "qwen2.5-coder-32b-instruct"]
+```
+
+### 8.3 完整示例
+
+```bash
+# 1. 准备模型定义
+mkdir -p ~/.latte/models.d
 
 cat > ~/.latte/models.d/anthropic.toml <<'EOF'
 [[models]]
@@ -1058,7 +1068,10 @@ id = "claude-sonnet-4-20250514"
 api = "anthropic"
 provider = "anthropic"
 base_url = "https://api.anthropic.com"
-api_key = "${ANTHROPIC_API_KEY}"
+api_key = "${ANTHROPIC_API_KEY}"     # 环境变量展开
+max_tokens_5xx = 2
+cooldown_secs = 30
+schedules = [{ after = 2, wait = 10 }, { after = 5, wait = 60 }]
 EOF
 
 cat > ~/.latte/models.d/deepseek.toml <<'EOF'
@@ -1070,39 +1083,100 @@ base_url = "https://api.deepseek.com"
 api_key = "${DEEPSEEK_API_KEY}"
 EOF
 
-# 2. 启动
+# 2. 配置 proxy.toml（见 §8.2）
+
+# 3. 启动
 export ANTHROPIC_API_KEY=sk-ant-...
 export DEEPSEEK_API_KEY=sk-...
-latte-model-proxy
+latte-model-proxy --config=./proxy.toml
 
-# 3. 客户端调用（OpenAI SDK 即可）
-# base_url 指向 proxy；model 字段直接写下游 model id 或 CLI 暴露的 alias
+# 4. 客户端调用
+#   直接指定 model id：
+#     model = "claude-sonnet-4-20250514"
+#   或用 proxy-default 走静默选路：
+#     model = "proxy-default"
 ```
 
-### 8.3 暴露的路由
+### 8.4 两种请求路径
+
+| 客户端发送 | 代理行为 |
+|---|---|
+<code>model = "proxy-default"</code>（或 `proxy.toml` 中 `proxy_default_model` 配置的值） | 走 `Router::select_candidates(&pool)` — 按 `pool` 顺序找第一个可用的物理 model。客户端永不知用哪个。body 里 `model` 字段自动替换为选中的物理 id。 |
+<code>model = "claude-sonnet-4-20250514"</code>（任意 `models.d/*.toml` 中存在的 id） | 走 `Router::select(id)` — 直接查找该 model。404 如果不服务。 |
+
+### 8.5 暴露的路由
 
 | 路径 | 方法 | 说明 |
-| --- | --- | --- |
-| `/`                            | GET, HEAD  | 健康检查横幅 |
-| `/api/version`                 | GET         | 版本号 JSON |
-| `/v1/models`                   | GET         | OpenAI 形状，列出 pool 中所有 model |
-| `/v1/chat/completions`         | POST        | OpenAI Chat Completions，支持 `stream: true`（SSE 透传） |
-| `/v1/messages`                  | POST        | Anthropic Messages，支持 `stream: true` |
-| `/api/tags`                    | GET         | Ollama 形状 |
-| `/api/show`                    | POST        | Ollama 形状（单模型详情 + 厂商信息） |
-| `/api/chat`                    | POST        | Ollama 形状，转发到 OpenAI `/chat/completions` 并翻译响应 |
+|---|---|---|
+| `/` | GET, HEAD | 横幅 + 版本 + pool + api_key 状态 |
+| `/health` | GET | **存活探针**。进程活着就 200 `ok\n`。k8s liveness |
+| `/ready` | GET | **就绪探针**。catalog 有 model 则 200 `ready\n`，空池返 503。k8s readiness |
+| `/api/version` | GET | 版本号 JSON |
+| `/v1/models` | GET | OpenAI 形状，列出 pool 中所有 model |
+| `/v1/chat/completions` | POST | OpenAI Chat Completions，支持 `stream: true`（SSE 透传） |
+| `/v1/messages` | POST | Anthropic Messages，支持 `stream: true` |
+| `/api/tags` | GET | Ollama 形状 |
+| `/api/show` | POST | Ollama 形状（单模型详情 + 厂商信息） |
+| `/api/chat` | POST | Ollama 形状，转发到 OpenAI `/chat/completions` 并翻译响应 |
 
 三个形态是同一组后端：客户端可以用任何一种 SDK 直接对接。
 
-### 8.4 限流 + 熔断行为
+### 8.6 可选 API Key 鉴权
+
+`proxy.toml` 中配置 `server.api_key` 后，以下路由必须带 `Authorization: Bearer <key>`：
+- `POST /v1/chat/completions`
+- `POST /v1/messages`
+- `POST /api/chat`
+
+不配置则完全不验证（当前行为兼容）。探针 / 发现路由永远公开。
+
+```bash
+# 配了 api_key 的情况下，客户端调用
+curl -H "Authorization: Bearer mysecret" \
+     -H "content-type: application/json" \
+     -d '{"model":"proxy-default","messages":[{"role":"user","content":"hi"}]}' \
+     http://127.0.0.1:11434/v1/chat/completions
+```
+
+鉴权失败返回 `401 Unauthorized` + 结构化 warn 日志。
+
+### 8.7 限流 + 熔断行为
 
 - 请求里 `model` 字段是 pool 中的 id → `Router::select` 命中
-- 命中 model 冷却中 → 自动降级到 pool 下一个 model
-- 全部冷却 → 503 + `Retry-After: <秒数>`
-- 上游 429 → 该 model 拉出到下个 refresh 时间点（`max(配置算的, Retry-After)`）
-- 上游 5xx 连续 N 次 → 该 model 拉出 N 秒
+- 命中的 model 当前在冷却中 → `Router::select_candidates` 自动跳过，走 pool 下一个
+- 全部冷却 → `503` + `Retry-After: <秒数>`
+- 上游 429 → 按 `schedules` 配置 + `Retry-After` header 算出冷却截止时间
+- 上游 5xx 连续 N 次（`max_tokens_5xx`） → 该 model 拉出 `cooldown_secs` 秒
 
-### 8.5 使用示例（OpenAI SDK）
+### 8.8 优雅关闭
+
+接收 SIGINT（Ctrl-C）或 SIGTERM 后：
+1. 停止接受新连接
+2. 等待 in-flight 请求完成
+3. 退出
+
+```bash
+kill -TERM <pid>
+# log: "received SIGTERM, shutting down"
+```
+
+### 8.9 请求体大小限制
+
+所有路由上的 `DefaultBodyLimit::max(10 MB)`。超过返 `413 Payload Too Large`。
+
+### 8.10 CLI 参数
+
+| 参数 | 说明 |
+|---|---|
+| `--config PATH` | 覆盖 `proxy.toml` 路径；搜索：`<PATH>` → `./proxy.toml` → `~/.latte/proxy.toml` |
+| `--host HOST` | 覆盖 `server.host` |
+| `--port PORT` | 覆盖 `server.port` |
+| `--models-dir PATH` | 覆盖 `catalog.models_dir` |
+| `--proxy-default-model NAME` | 覆盖 `catalog.proxy_default_model` |
+| `--pool A,B,C` | 覆盖 `catalog.pool`（逗号分隔） |
+| `--api-key KEY` | 覆盖 `server.api_key` |
+
+### 8.11 使用示例（OpenAI SDK）
 
 ```python
 from openai import OpenAI
@@ -1112,32 +1186,49 @@ client = OpenAI(
     api_key="not-used",
 )
 
+# 直接指定 model
 resp = client.chat.completions.create(
     model="claude-sonnet-4-20250514",
     messages=[{"role": "user", "content": "用 Rust 写一个二分查找"}],
 )
 print(resp.choices[0].message.content)
+
+# 或用 proxy-default 静默选路
+resp = client.chat.completions.create(
+    model="proxy-default",
+    messages=[{"role": "user", "content": "hi"}],
+)
 ```
 
-### 8.6 程序化使用（库 API）
+### 8.12 程序化使用（库 API）
 
 ```rust,no_run
-use latte_model_proxy::{ModelEntry, Server, serve};
+use latte_model_proxy::{ModelEntry, Server, ServerRuntime, serve};
+use latte_router::Router;
+use std::sync::Arc;
 
 # async fn run() -> anyhow::Result<()> {
-let pool: Vec<ModelEntry> = vec![/* 从 latte-router::ModelCatalog 加载 */];
-let handle = serve(pool, "127.0.0.1:11434".to_string()).await?;
-// ...
+let entries: Vec<ModelEntry> = vec![/* 从 latte-router::ModelCatalog 加载 */];
+let runtime = ServerRuntime {
+    router: Arc::new(Router::with_system_clock(entries)),
+    version: env!("CARGO_PKG_VERSION").to_string(),
+    proxy_default_model: "proxy-default".to_string(),
+    pool: vec!["claude-sonnet-4-20250514".to_string()],
+    api_key: None,
+};
+let handle = serve(runtime, "127.0.0.1:11434".to_string()).await?;
 # Ok(())
 # }
 ```
 
-### 8.7 测试
+### 8.13 测试
 
-20 个集成测试覆盖（`cargo test -p latte-model-proxy`）：
+52 个集成测试覆盖（`cargo test -p latte-model-proxy`）：
 
-- `cli_test`：Args 解析（host/port/models/models-dir/config）
-- `health_test`、`openai_models_test`、`openai_chat_test`、`openai_chat_stream_test`：OpenAI 兼容（含 SSE 透传）
+- `cli_test`：Args 解析（host/port/pool/models-dir/config/api-key）
+- `health_test`：`/health`、`/ready`、body size limit（10MB）、root banner、`/api/version`
+- `auth_test`：api_key 配置后 401/200 行为 + `/health` `/ready` 永远公开
+- `openai_models_test`、`openai_chat_test`、`openai_chat_stream_test`：OpenAI 兼容（含 SSE 透传）
 - `anthropic_messages_test`：Anthropic 兼容 + 协议不匹配返 400
 - `ollama_compat_test`：`/api/tags`、`/api/show`、`/api/chat`（Ollama ↔ OpenAI 翻译）
 - `serve_entry_test`：`serve()` 绑端口 + Router::select / UnknownModel 路径
