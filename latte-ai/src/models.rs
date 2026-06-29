@@ -3,10 +3,10 @@ use serde::{Deserialize, Serialize};
 /// Supported API types for model providers.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum ApiType {
-    #[serde(rename = "openai-completions")]
+    #[serde(rename = "openai-completions", alias = "openai")]
     OpenAiCompletions,
 
-    #[serde(rename = "anthropic-messages")]
+    #[serde(rename = "anthropic-messages", alias = "anthropic")]
     AnthropicMessages,
 }
 

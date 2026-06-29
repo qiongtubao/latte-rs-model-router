@@ -1,0 +1,13 @@
+[[models]]
+id = "claude-sonnet-4-20250514"
+name = "Claude Sonnet 4"
+api = "anthropic"
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"
+context_window = 200000
+max_tokens = 8192
+rate_limit_refresh_anchor        = "2026-06-29T00:00:00Z"
+rate_limit_refresh_interval_secs = 18000
+retry_count_5xx   = 5
+cooldown_5xx_secs = 600

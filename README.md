@@ -4,27 +4,35 @@ Rust AI model 客户端库 + 参数调优工具。
 
 ## 项目结构
 
-\`\`\`
+```
 latte-rs-model-router/
-├── latte-ai/                  # AI client 库
+├── latte-ai/                  # AI client 库（OpenAI + Anthropic 协议 + 流式 + thinking）
 │   ├── params.rs              # 生成参数类型: GenerateParams, ThinkingBudget
-│   ├── models.rs              # 模型定义: Model, Message, Role, Completion
-│   ├── client.rs              # 客户端: AiClient (OpenAI + Anthropic) + Dispatcher hook
-│   ├── vendor.rs              # 厂商抽象: VendorRegistry / TokenProvider / ModelDiscovery / Dispatcher / VendorUsage
-│   ├── vendor_toml.rs         # vendors.toml 配置解析
-│   ├── error.rs               # 错误类型
-│   ├── examples/              # 示例: vendor_demo, router, streaming, tool_use, prompt_caching, ...
-│   └── tests/                 # 集成测试: vendor_integration (wiremock)
-├── latte-tune/                # 参数调优 CLI 工具
+│   ├── models.rs              # 类型: Model / Message / Role / Completion / ApiType / TokenUsage
+│   ├── client.rs              # 客户端: AiClient（chat + chat_stream）
+│   ├── error.rs               # AiError + Result
+│   └── examples/              # 示例: basic, streaming
+├── latte-router/              # 模型 catalog + 优先级选择 + 断路器
+│   ├── config.rs              # ModelEntry（per-model 冷却配置）+ Route + RouterError
+│   ├── clock.rs               # Clock trait + SystemClock
+│   ├── catalog.rs             # ModelCatalog 加载 ~/.latte/models.d/*.toml + ./.latte/models.d
+│   ├── breaker.rs             # CircuitBreaker：429 调度冷却 + 5xx 阈值熔断
+│   ├── selector.rs            # 选路：按 pool 顺序，跳过冷却中
+│   ├── proxy_config.rs        # proxy.toml schema (server + catalog)
+│   ├── lib.rs                 # Router 串起来
+│   └── tests/                 # 15 个验收用例
+├── latte-tune/                # 参数调优 + 单 model 聊天 CLI
 │   ├── sweeper.rs             # 参数扫描组合
 │   ├── prompts.rs             # 编程测试 prompt 集
 │   ├── report.rs              # 结果格式化输出
-│   └── main.rs                # CLI 入口（含 `vendors` 子命令: list/status/refresh/discover）
-├── models.yaml                # 示例模型配置文件 (YAML)
-├── models.toml                # 示例模型配置文件 (TOML, 兼容旧版)
-├── vendors.toml               # 示例厂商配置 (TOML)
+│   └── main.rs                # CLI 入口：sweep / list-models / list-prompts / compare / chat
+├── latte-model-proxy/         # HTTP 代理（Ollama / OpenAI / Anthropic 兼容）
+│   ├── cli.rs                 # clap 参数定义（--config / --host / --port / --models / --models-dir）
+│   ├── server.rs              # axum 路由：/api/{tags,show,chat}、/v1/{models,chat/completions}、/v1/messages
+│   ├── main.rs                # 入口：latte-model-proxy --models=id1,id2 --port=6666
+│   └── tests/                 # 20 个集成测试（wiremock 模拟下游）
 └── README.md
-\`\`\`
+```
 
 ---
 
@@ -847,232 +855,293 @@ GenerateParams::default()            // 全部 None，使用模型提供商默�
 
 ---
 
-## 6. 厂商抽象 (Vendor Abstraction)
+## 6. 路由 + 弹性（`latte-router`）
 
-`latte-ai::vendor` 模块集中管理多 vendor：自动 token 刷新、model 发现、feature 细粒度开关、用量统计、health check。配合 `latte-tune vendors` CLI 直接运维。
+`latte-router` 提供静态模型 catalog、按优先级选路、断路器（429 调度 + 5xx 阈值）—— 与 `latte-ai` 的 wire 协议解耦。`latte-model-proxy` 的 HTTP 层只做翻译。
 
-### 6.1 核心组件
+### 6.1 proxy 配置文件
 
-| 类型 | 作用 |
-|------|------|
-| `VendorId` | Vendor 标识 newtype，防止字符串拼写错 |
-| `TokenProvider` (trait) | 抽象 token 供应 |
-| `ApiKeyProvider` | 静态 API key 实现 |
-| `BearerProvider` | Bearer token + 自动 refresh |
-| `FixedIntervalRefresher` | 固定间隔自动 refresh 回调 |
-| `ModelDiscovery` (trait) | 抽象 model 列表发现 |
-| `AnthropicModelsApi` / `OpenAiModelsApi` | 通过 `/v1/models` API 拉取 |
-| `Manual` | 静态 model 列表 |
-| `VendorConfig` | 单个 vendor 完整配置（auth / discovery / health / disabled_features） |
-| `VendorRegistry` | 多 vendor 中央索引（`Arc<HashMap<VendorId, VendorConfig>>`） |
-| `VendorStatus` | 运行时状态：`auth_valid` / `token_remaining_secs` / `health_ok` / `health_latency_ms` |
-| `VendorUsage` | 累计 token / 花费统计 |
-| `HealthCheck` | HTTP / TCP / None 健康检查策略 |
-| `VendorFeature` | 功能枚举：`PromptCaching` / `ExtendedCacheTtl` / `ToolUse` / `Thinking` / `Vision` / `Stream` / `Reasoning` |
-| `Dispatcher` | feature gate hook，挂在 `AiClient` 上 fail-fast 拦截禁用功能 |
-
-### 6.2 TOML 配置文件
-
-推荐 `vendors.toml` 集中管理所有 vendor。`latte-tune vendors` 自动发现路径（与 `models.yaml` 一致）：
-
-1. `--config <path>` 显式指定
-2. `./vendors.toml`
-3. `~/.latte/vendors.toml`
-
-格式：
+proxy 的所有行为在 `proxy.toml` 里（canonical / 最全参数），CLI flags 只覆盖其中字段。
 
 ```toml
-# vendors.toml
-[[vendors]]
-id = "anthropic"
-protocol = "anthropic"
-base_url = "https://api.anthropic.com"
-auth = { type = "api_key", key = "${ANTHROPIC_API_KEY}" }
-disabled_features = ["extended_cache_ttl"]
-health_check = { type = "http", path = "/v1/messages" }
-discovery = "anthropic"
+# proxy.toml
+[server]
+host = "127.0.0.1"
+port = 11434
 
-[[vendors]]
-id = "deepseek"
-protocol = "openai"
-base_url = "https://api.deepseek.com"
-# Bearer + 1h 自动刷新，刷新时从 DEEPSEEK_TOKEN env 读新值
-auth = { type = "bearer", token = "initial", interval_secs = 3600, refresh_env = "DEEPSEEK_TOKEN" }
-discovery = "openai"
-
-[[vendors]]
-id = "local-ollama"
-base_url = "http://localhost:11434"
-auth = { type = "api_key", key = "ollama" }
-discovery = { type = "manual", models = [
-    { id = "qwen2.5-coder:7b", display_name = "Qwen 2.5 Coder 7B", context_window = 8192 },
-    { id = "llama3.1:8b",      display_name = "Llama 3.1 8B" }
-] }
+[catalog]
+models_dir = "~/.latte/models.d"        # 支持 ~ 展开
+models = ["claude-sonnet-4-20250514", "deepseek-v4-flash"]  # 数组顺序 = 权重从大到小
 ```
 
 字段说明：
 
-| 字段 | 必填 | 默认 | 说明 |
-|------|------|------|------|
-| `id` | ✓ | — | Vendor 唯一标识 |
-| `base_url` | ✓ | — | API 端点 |
-| `auth` | ✓ | — | `{ type = "api_key", key = "..." }` 或 `{ type = "bearer", token = "...", interval_secs = 3600, refresh_env = "ENV_VAR" }` |
-| `protocol` | ✗ | `"openai"` | 仅用于 metrics / 调试；wire format 由 discovery impl 决定 |
-| `discovery` | ✗ | 空 manual | `"openai"` / `"anthropic"` 简写 或 `{ type = "manual", models = [...] }` |
-| `health_check` | ✗ | `None` | `{ type = "http", path = "/..." }` / `"tcp"` / `"none"` |
-| `disabled_features` | ✗ | `[]` | 禁用的 `VendorFeature` 列表（snake_case 字符串） |
+| 字段 | 类型 | 默认 | 含义 |
+|---|---|---|---|
+| `server.host` | string | `127.0.0.1` | 绑定地址 |
+| `server.port` | u16 | `11434` | 监听端口 |
+| `catalog.models_dir` | string | `~/.latte/models.d` | 模型定义目录；启动时同时找 `./.latte/models.d` 做项目级覆盖 |
+| `catalog.models` | array | `[]` | 暴露的 model id 列表；**数组顺序 = 优先级**（rank 0 首选，降级到 rank 1） |
 
-### 6.3 程序化使用
+CLI flags（覆盖 proxy.toml）：
 
-```rust
-use latte_ai::vendor_toml::registry_from_toml_str;
-use latte_ai::vendor::{Dispatcher, VendorId, VendorFeature};
-use std::collections::HashSet;
-use std::sync::Arc;
+| flag | 覆盖 |
+|---|---|
+| `--config <path>` | proxy.toml 路径 |
+| `--host <X>` | `server.host` |
+| `--port <N>` | `server.port` |
+| `--models id1,id2` | `catalog.models` |
+| `--models-dir <path>` | `catalog.models_dir` |
 
-// 1. 加载 registry
-let reg = Arc::new(registry_from_toml_str(include_str!("../vendors.toml"))?);
+### 6.2 模型定义（`models.d/*.toml`）
 
-// 2. 拿 token
-let token = reg.get_token(&VendorId::new("anthropic")).await?;
+每个文件可放一个或多个 `[[models]]`。冷却参数 per-model 写在每个 model 下。
 
-// 3. 拉 model 列表
-let models = reg.discover_models(&VendorId::new("anthropic")).await?;
+```toml
+# ~/.latte/models.d/anthropic.toml
+[[models]]
+id = "claude-sonnet-4-20250514"
+name = "Claude Sonnet 4"
+api = "anthropic"                # 也接受 "anthropic-messages"
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"  # ${ENV} 加载时展开
+context_window = 200000
+max_tokens = 8192
 
-// 4. 强制 refresh
-let new_token = reg.refresh_now(&VendorId::new("deepseek")).await?;
+# 429 调度冷却（per-model）
+rate_limit_refresh_anchor        = "2026-06-29T00:00:00Z"  # 调度起点
+rate_limit_refresh_interval_secs = 18000                    # 调度间隔（5h）
 
-// 5. 查状态
-let status = reg.status(&VendorId::new("anthropic")).await?;
-println!("auth_valid={}, health_ok={}", status.auth_valid, status.health_ok);
-
-// 6. Record 用量（chat() 返 Completion 后手动调）
-reg.record_usage(
-    &VendorId::new("anthropic"),
-    &completion.usage,
-    cost_usd,
-);
-let total = reg.usage(&VendorId::new("anthropic")).unwrap_or_default();
-println!("累计 {} 次请求，{} tokens，${:.4}",
-    total.request_count,
-    total.input_tokens + total.output_tokens,
-    total.total_cost_usd);
+# 5xx 熔断（per-model）
+retry_count_5xx   = 5
+cooldown_5xx_secs = 600   # 默认 10 min
 ```
 
-### 6.4 配合 AiClient + Dispatcher
+```toml
+# ~/.latte/models.d/deepseek.toml
+[[models]]
+id = "deepseek-v4-flash"
+api = "openai"                    # 也接受 "openai-completions"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
 
-Dispatcher 在 `chat()` 入口拦截 vendor 禁用的 feature，fail-fast：
+# 1 分钟限流窗口
+rate_limit_refresh_anchor        = "2026-06-29T00:00:00Z"
+rate_limit_refresh_interval_secs = 60
 
-```rust
-use latte_ai::AiClient;
-use latte_ai::vendor::{Dispatcher, VendorFeature};
-use std::collections::HashSet;
-use std::sync::Arc;
-
-let reg = Arc::new(registry_from_toml_str(toml)?);
-let dispatcher = Arc::new(Dispatcher::new(reg));
-
-let model = Model { provider: "anthropic".into(), /* ... */ .. };
-let client = AiClient::new(model)?.with_dispatcher(dispatcher);
-
-// 请求时声明用到的 features
-let requested: HashSet<VendorFeature> = [
-    VendorFeature::PromptCaching,
-    VendorFeature::ToolUse,
-].into_iter().collect();
-
-match client.chat_with_features(&messages, &params, &requested).await {
-    Ok(c) => println!("ok: {}", c.content),
-    Err(e) if format!("{e}").contains("disabled") => {
-        eprintln!("vendor 禁用了该 feature: {e}");
-    }
-    Err(e) => return Err(e.into()),
-}
+retry_count_5xx   = 5
+cooldown_5xx_secs = 600
 ```
 
-若 vendor 的 `disabled_features` 包含 `PromptCaching` 或 `ToolUse`，`chat_with_features` 会立即返 `Err(AiError::Other("vendor: feature ... disabled for vendor ..."))`，**不会发起 HTTP 请求**。
+`[[models]]` 字段表：
 
-### 6.5 CLI: `latte-tune vendors`
+| 字段 | 类型 | 必填 | 默认 | 含义 |
+|---|---|---|---|---|
+| `id` | string | 是 | — | 模型唯一标识 |
+| `name` | string | 否 | = `id` | 人类可读名（展示用） |
+| `api` | string | 是 | — | 协议：`"anthropic"` / `"openai"`（也接受长写 `"anthropic-messages"` / `"openai-completions"`） |
+| `provider` | string | 是 | — | 厂商标识（分组/筛选用） |
+| `base_url` | string | 是 | — | 上游 API 根 URL |
+| `api_key` | string | 是 | — | 认证密钥；`${ENV}` 形式加载时展开 |
+| `context_window` | u32 | 否 | `65536` | 输入 token 上限（信息性） |
+| `max_tokens` | u32 | 否 | `4096` | 输出 token 上限（信息性） |
+| `rate_limit_refresh_anchor` | string (ISO 8601 UTC) | 否 | `1970-01-01T00:00:00Z` | 429 调度起点 |
+| `rate_limit_refresh_interval_secs` | u64 | 否 | `60` | 429 调度间隔 |
+| `retry_count_5xx` | u32 | 否 | `5` | 5xx 连续失败 N 次 → 熔断 |
+| `cooldown_5xx_secs` | u64 | 否 | `600` | 5xx 熔断后冷却秒数（默认 10 min） |
+
+### 6.3 限流与熔断
+
+两个机制并存：
+
+1. **HTTP 429** → 拉出该 model 直到下个 refresh 时间点 `max(配置算的 refresh, now + Retry-After)`
+2. **HTTP 5xx** → 连续 N 次 → 拉出该 model N 秒（默认 600s = 10 min）
+
+成功响应（2xx / 4xx 非 429）清零 5xx 计数器。冷却中的 model 不参与选路，自动降级到 pool 下一个。
+
+全部冷却中 → 返 `RouterError::AllUnavailable { retry_after_secs }`，proxy 映射为 `503 + Retry-After`。
+
+### 6.4 启动示例
 
 ```bash
-# 列出所有 vendor（id / base_url / auth_kind / disabled features）
-latte-tune vendors list
+# 使用默认 proxy.toml + 默认 models.d/
+latte-model-proxy
 
-# 查 vendor 状态（auth / token 剩余 / health）
-latte-tune vendors status anthropic
-
-# 强制刷新 token（返 masked token）
-latte-tune vendors refresh deepseek
-
-# 拉 vendor 的 model 列表
-latte-tune vendors discover anthropic
-
-# 指定非默认配置
-latte-tune vendors --config /etc/latte/vendors.toml list
+# 显式指定
+latte-model-proxy \
+  --config ~/.latte/proxy.toml \
+  --models=claude-sonnet-4-20250514,deepseek-v4-flash \
+  --port=6666
 ```
 
-输出示例：
+省略 `--config`：自动找 `./proxy.toml` → `~/.latte/proxy.toml`。省略 `--models`：用 `proxy.toml` 的 `catalog.models`。都没给 → 启动失败。
 
-```
-$ latte-tune vendors list
-Configured vendors (2):
-  anthropic    https://api.anthropic.com  api_key  disabled=[extendedcachettl]
-  local-ollama http://localhost:11434     api_key  disabled=[-]
-
-$ latte-tune vendors status anthropic
-Vendor: anthropic
-  auth_kind:    api_key
-  auth_valid:   yes
-  token_left:   never expires
-  health:       ok (243ms)
-```
-
-### 6.6 用量统计（Token Usage）
-
-`VendorUsage` 提供每个 vendor 累计统计：
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `request_count` | `u64` | 累计请求数 |
-| `input_tokens` | `u64` | 累计 input token |
-| `output_tokens` | `u64` | 累计 output token |
-| `thinking_tokens` | `u64` | 累计 thinking token |
-| `total_cost_usd` | `f64` | 累计花费（美元） |
-| `last_request_at` | `Option<Instant>` | 上次 record 时间 |
-
-派生方法：`avg_input_tokens` / `avg_output_tokens` / `avg_cost_usd`。
-
-`record_usage` 由调用方在每次 `chat()` 完成后手动调用（可包装成中间件）：
+### 6.5 程序化使用
 
 ```rust
-let cost = (usage.input_tokens  as f64 / 1_000_000.0) * model.cost_per_million_input
-         + (usage.output_tokens as f64 / 1_000_000.0) * model.cost_per_million_output;
-reg.record_usage(&VendorId::new(&model.provider), &usage, cost);
+use latte_router::{ModelEntry, ModelCatalog, Router, SystemClock};
+use std::sync::Arc;
+
+// 1. 直接构造（不读文件）
+let pool = vec![/* ModelEntry ... */];
+let router = Arc::new(Router::with_system_clock(pool));
+
+// 2. 选路
+match router.select("claude-sonnet-4-20250514") {
+    Ok(route) => { /* 转发到 route.base_url，用 route.api_key */ }
+    Err(e) => eprintln!("{e}"),
+}
+
+// 3. 喂响应信号
+router.record("claude-sonnet-4-20250514", 200, None);  // 成功
+router.record("claude-sonnet-4-20250514", 429, Some(60));  // 429 + Retry-After
+router.record("claude-sonnet-4-20250514", 500, None);  // 5xx
+
+// 4. 加载目录
+let mut catalog = ModelCatalog::new();
+catalog.load_dir("~/.latte/models.d")?;
 ```
-
-`reset_usage()` 用于账单周期重置。`usages()` 一次性拿所有 vendor 的 snapshot。
-
-### 6.7 完整示例
-
-- `latte-ai/examples/vendor_demo.rs` — vendor 抽象 4 步使用示例
-- `latte-ai/tests/vendor_integration.rs` — wiremock 集成测试（11 个）
-- 单元测试 38 个 + doctest 4 个，**共 62/62 通过**
-
----
-
 ## 7. 开发与测试
 
 ```bash
-# 全量测试（62 个）
-cargo test
+# 全量测试（40 个）
+cargo test --workspace
 
-# 仅 latte-ai
+# 单 crate
 cargo test -p latte-ai
+cargo test -p latte-router
+cargo test -p latte-model-proxy
+cargo test -p latte-tune
 
 # 编译验证
-cargo build --release
+cargo build --workspace --release
+```
 
-# 跑 vendor CLI（需要先有 vendors.toml）
-cargo run -- vendors list
-cargo run -- vendors status anthropic
+## 8. HTTP 代理服务（`latte-model-proxy`）
+
+`latte-model-proxy` 是一个本地 HTTP 代理服务，把多个下游 AI 厂商聚合到一个端点上，
+客户端用 OpenAI / Anthropic / Ollama 任意一种 API shape 调用，本服务按
+请求里的 `model` 路由到对应的下游厂商。可作为 OpenAI SDK、Claude Code、
+Ollama 生态的统一入口。选路 + 限流冷却 + 5xx 熔断都委托给 `latte-router`。
+
+### 8.1 启动
+
+```bash
+# 默认：自动找 ./proxy.toml → ~/.latte/proxy.toml，models 来自 proxy.toml
+latte-model-proxy
+
+# 显式指定 model 列表（CLI 覆盖 proxy.toml）
+latte-model-proxy --models=claude-sonnet-4-20250514,deepseek-v4-flash --port=6666
+```
+
+### 8.2 完整示例
+
+```bash
+# 1. 准备配置
+mkdir -p ~/.latte/models.d
+
+cat > ~/.latte/proxy.toml <<'EOF'
+[server]
+host = "127.0.0.1"
+port = 11434
+
+[catalog]
+models_dir = "~/.latte/models.d"
+models = ["claude-sonnet-4-20250514", "deepseek-v4-flash"]
+EOF
+
+cat > ~/.latte/models.d/anthropic.toml <<'EOF'
+[[models]]
+id = "claude-sonnet-4-20250514"
+api = "anthropic"
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key = "${ANTHROPIC_API_KEY}"
+EOF
+
+cat > ~/.latte/models.d/deepseek.toml <<'EOF'
+[[models]]
+id = "deepseek-v4-flash"
+api = "openai"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+EOF
+
+# 2. 启动
+export ANTHROPIC_API_KEY=sk-ant-...
+export DEEPSEEK_API_KEY=sk-...
+latte-model-proxy
+
+# 3. 客户端调用（OpenAI SDK 即可）
+# base_url 指向 proxy；model 字段直接写下游 model id 或 CLI 暴露的 alias
+```
+
+### 8.3 暴露的路由
+
+| 路径 | 方法 | 说明 |
+| --- | --- | --- |
+| `/`                            | GET, HEAD  | 健康检查横幅 |
+| `/api/version`                 | GET         | 版本号 JSON |
+| `/v1/models`                   | GET         | OpenAI 形状，列出 pool 中所有 model |
+| `/v1/chat/completions`         | POST        | OpenAI Chat Completions，支持 `stream: true`（SSE 透传） |
+| `/v1/messages`                  | POST        | Anthropic Messages，支持 `stream: true` |
+| `/api/tags`                    | GET         | Ollama 形状 |
+| `/api/show`                    | POST        | Ollama 形状（单模型详情 + 厂商信息） |
+| `/api/chat`                    | POST        | Ollama 形状，转发到 OpenAI `/chat/completions` 并翻译响应 |
+
+三个形态是同一组后端：客户端可以用任何一种 SDK 直接对接。
+
+### 8.4 限流 + 熔断行为
+
+- 请求里 `model` 字段是 pool 中的 id → `Router::select` 命中
+- 命中 model 冷却中 → 自动降级到 pool 下一个 model
+- 全部冷却 → 503 + `Retry-After: <秒数>`
+- 上游 429 → 该 model 拉出到下个 refresh 时间点（`max(配置算的, Retry-After)`）
+- 上游 5xx 连续 N 次 → 该 model 拉出 N 秒
+
+### 8.5 使用示例（OpenAI SDK）
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://127.0.0.1:11434/v1",
+    api_key="not-used",
+)
+
+resp = client.chat.completions.create(
+    model="claude-sonnet-4-20250514",
+    messages=[{"role": "user", "content": "用 Rust 写一个二分查找"}],
+)
+print(resp.choices[0].message.content)
+```
+
+### 8.6 程序化使用（库 API）
+
+```rust,no_run
+use latte_model_proxy::{ModelEntry, Server, serve};
+
+# async fn run() -> anyhow::Result<()> {
+let pool: Vec<ModelEntry> = vec![/* 从 latte-router::ModelCatalog 加载 */];
+let handle = serve(pool, "127.0.0.1:11434".to_string()).await?;
+// ...
+# Ok(())
+# }
+```
+
+### 8.7 测试
+
+20 个集成测试覆盖（`cargo test -p latte-model-proxy`）：
+
+- `cli_test`：Args 解析（host/port/models/models-dir/config）
+- `health_test`、`openai_models_test`、`openai_chat_test`、`openai_chat_stream_test`：OpenAI 兼容（含 SSE 透传）
+- `anthropic_messages_test`：Anthropic 兼容 + 协议不匹配返 400
+- `ollama_compat_test`：`/api/tags`、`/api/show`、`/api/chat`（Ollama ↔ OpenAI 翻译）
+- `serve_entry_test`：`serve()` 绑端口 + Router::select / UnknownModel 路径
+
+```bash
+cargo test -p latte-model-proxy
 ```

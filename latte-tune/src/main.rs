@@ -1,18 +1,26 @@
-use std::path::PathBuf;
+//! `latte-tune` — AI model parameter tuner / single-model chat client.
+//!
+//! Loads models from `~/.latte/models.d/` and `./.latte/models.d/` via
+//! `latte-router::ModelCatalog`, or from `--config <dir>` if given.
+
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
 use latte_ai::models::{ApiType, Message, Model, Role, StreamEvent, TokenUsage};
 use latte_ai::params::GenerateParams;
 use latte_ai::AiClient;
-use latte_ai::vendor::{VendorId, VendorRegistry};
-use latte_ai::vendor_toml::registry_from_toml_str;
-use crate::report::UsageDisplay;
+use latte_router::{ModelCatalog, ModelEntry};
 
 mod prompts;
 mod report;
 mod sweeper;
+
+use crate::prompts::TestPrompt;
+use crate::report::UsageDisplay;
+use crate::sweeper::SweepResult;
 
 #[derive(Parser)]
 #[command(name = "latte-tune", version, about = "AI model parameter tuner")]
@@ -25,30 +33,30 @@ struct Cli {
 enum Commands {
     /// Run a parameter sweep on a model
     Sweep {
-        /// Model ID (e.g. "deepseek-chat", "claude-sonnet-4-20250514"). Optional when --config is used.
+        /// Model ID (looked up in models.d/)
         model: Option<String>,
 
-        /// API type: openai or anthropic
+        /// API type: openai or anthropic (only used when --config is not given)
         #[arg(long, default_value = "openai")]
         api: String,
 
-        /// Base URL for the API
+        /// Base URL (only used when --config is not given)
         #[arg(long)]
         base_url: Option<String>,
 
-        /// API key (or set env var: LATTE_API_KEY)
+        /// API key (only used when --config is not given)
         #[arg(long)]
         api_key: Option<String>,
 
-        /// Provider name
+        /// Provider name (only used when --config is not given)
         #[arg(long, default_value = "custom")]
         provider: String,
 
-        /// Max tokens
+        /// Max tokens (only used when --config is not given)
         #[arg(long, default_value_t = 4096)]
         max_tokens: u32,
 
-        /// Context window
+        /// Context window (only used when --config is not given)
         #[arg(long, default_value_t = 65536)]
         context_window: u32,
 
@@ -68,45 +76,40 @@ enum Commands {
         #[arg(long)]
         stream: bool,
 
-        /// Config file with model definitions (YAML or TOML)
+        /// Config dir (overrides default models.d/ lookup)
         #[arg(long)]
         config: Option<PathBuf>,
     },
 
     /// List configured models
     ListModels {
-        /// Config file (auto-discovered if not specified)
+        /// Config dir (overrides default models.d/ lookup)
         #[arg(long)]
         config: Option<PathBuf>,
     },
 
     /// List available test prompts
     ListPrompts,
+
     /// Compare parameters for a specific prompt
     Compare {
         /// Model ID
         model: String,
-
         /// API type
         #[arg(long, default_value = "openai")]
         api: String,
-
         /// Base URL
         #[arg(long)]
         base_url: Option<String>,
-
         /// API key
         #[arg(long)]
         api_key: Option<String>,
-
         /// Provider name
         #[arg(long, default_value = "custom")]
         provider: String,
-
         /// Max tokens
         #[arg(long, default_value_t = 4096)]
         max_tokens: u32,
-
         /// Prompt name to test
         #[arg(long)]
         prompt: String,
@@ -116,49 +119,87 @@ enum Commands {
     Chat {
         /// Prompt text. Reads from stdin if piped. Enters interactive REPL if omitted.
         prompt: Option<String>,
-
         /// Model ID to use (uses first configured model if not specified)
         #[arg(short, long)]
         model: Option<String>,
-
-        /// Config file (auto-discovered if not specified)
+        /// Config dir (overrides default models.d/ lookup)
         #[arg(long)]
         config: Option<PathBuf>,
-
         /// Disable streaming output
         #[arg(long)]
         no_stream: bool,
-
-        /// Force interactive REPL mode (default if no prompt and stdin is a terminal)
+        /// Force interactive REPL mode
         #[arg(short = 'r', long)]
         repl: bool,
     },
-    /// Manage vendor configs (list / status / refresh / discover)
-    Vendors {
-        #[command(subcommand)]
-        action: VendorsAction,
-
-        /// Config file (auto-discovered if not specified)
-        #[arg(long, global = true)]
-        config: Option<PathBuf>,
-    },
 }
 
-/// `latte-tune vendors` 子命令的二级动作
-#[derive(Subcommand)]
-enum VendorsAction {
-    /// 列出所有 vendor
-    List,
-    /// 查看单个 vendor 的健康 + token 状态
-    Status { id: String },
-    /// 强制刷新 vendor token
-    Refresh { id: String },
-    /// 拉 vendor 的 model 列表
-    Discover { id: String },
+fn resolve_tilde(s: &str) -> PathBuf {
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    } else if s == "~" {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(s)
+}
+
+/// Load models from `~/.latte/models.d/` (global) + `./.latte/models.d/` (project override),
+/// or from `--config <dir>` if given.
+fn load_models_resolved(config_dir: Option<&Path>) -> Result<Vec<Model>> {
+    let mut catalog = ModelCatalog::new();
+
+    let (global_dir, project_dir) = match config_dir {
+        Some(p) => (p.to_path_buf(), None),
+        None => {
+            let global = resolve_tilde("~/.latte/models.d");
+            let project = PathBuf::from(".latte/models.d");
+            (global, Some(project))
+        }
+    };
+
+    let _ = catalog.load_dir(&global_dir);
+    if let Some(p) = project_dir {
+        let _ = catalog.load_dir(&p);
+    }
+
+    if catalog.is_empty() {
+        anyhow::bail!(
+            "no models found; create {} (and/or ./.latte/models.d) or pass --config <dir>",
+            global_dir.display()
+        );
+    }
+
+    let mut models: Vec<Model> = catalog
+        .ids()
+        .map(|id| entry_to_model(catalog.get(id).expect("just enumerated")))
+        .collect();
+    models.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
+    Ok(models)
+}
+
+/// Convert a `latte_router::ModelEntry` to a `latte_ai::models::Model`.
+fn entry_to_model(entry: &ModelEntry) -> Model {
+    Model {
+        id: entry.id.clone(),
+        name: entry.display_name().to_string(),
+        api: entry.api,
+        provider: entry.provider.clone(),
+        base_url: entry.base_url.clone(),
+        api_key: entry.api_key.clone(),
+        context_window: entry.context_window,
+        max_tokens: entry.max_tokens,
+        supports_thinking: entry.api == ApiType::AnthropicMessages,
+        cost_per_million_input: 0.0,
+        cost_per_million_output: 0.0,
+    }
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_target(false)
@@ -167,41 +208,70 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::ListModels { config } => list_models(config),
+        Commands::ListModels { config } => list_models(config.as_deref()),
         Commands::ListPrompts => list_prompts(),
         Commands::Sweep {
-            model, api, base_url, api_key, provider,
-            max_tokens, context_window, quick,
-            prompt_filter, sweep_filter, stream: _stream, config,
-        } => run_sweep(
-            model, api, base_url, api_key, provider,
-            max_tokens, context_window, quick,
-            prompt_filter, sweep_filter, config,
-        ).await,
-        Commands::Compare {
-            model, api, base_url, api_key, provider, max_tokens, prompt,
-        } => run_compare(
-            model, api, base_url, api_key, provider, max_tokens, prompt,
-        ).await,
-        Commands::Chat { prompt, model, config, no_stream, repl } => {
-            run_chat(prompt, model, config, no_stream, repl).await
+            model,
+            api,
+            base_url,
+            api_key,
+            provider,
+            max_tokens,
+            context_window,
+            quick,
+            prompt_filter,
+            sweep_filter,
+            stream: _stream,
+            config,
+        } => {
+            run_sweep(
+                model,
+                api,
+                base_url,
+                api_key,
+                provider,
+                max_tokens,
+                context_window,
+                quick,
+                prompt_filter,
+                sweep_filter,
+                config.as_deref(),
+            )
+            .await
         }
-        Commands::Vendors { action, config } => run_vendors(action, config).await,
+        Commands::Compare {
+            model,
+            api,
+            base_url,
+            api_key,
+            provider,
+            max_tokens,
+            prompt,
+        } => {
+            run_compare(
+                model, api, base_url, api_key, provider, max_tokens, prompt, None,
+            )
+            .await
+        }
+        Commands::Chat { prompt, model, config, no_stream, repl } => {
+            run_chat(prompt, model, config.as_deref(), no_stream, repl).await
+        }
     }
 }
-// ── Commands ───────────────────────────────────────────────────────────
 
-fn list_models(config: Option<PathBuf>) -> anyhow::Result<()> {
-    let models = load_models_resolved(config.as_ref())?;
+// ── ListModels ────────────────────────────────────────────────────────
+
+fn list_models(config_dir: Option<&Path>) -> Result<()> {
+    let models = load_models_resolved(config_dir)?;
     if models.is_empty() {
-        println!("No models configured. Create ~/.latte/models.yaml");
+        println!("No models configured.");
         return Ok(());
     }
     print_model_list(&models, None);
     Ok(())
 }
 
-fn list_prompts() -> anyhow::Result<()> {
+fn list_prompts() -> Result<()> {
     let test_prompts = prompts::all_prompts();
     println!("{}\n", "Available test prompts:".bold().underline());
     for tp in &test_prompts {
@@ -212,27 +282,83 @@ fn list_prompts() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Model resolution helpers ─────────────────────────────────────────
+
+fn find_model_index(models: &[Model], query: &str) -> Option<usize> {
+    if let Ok(n) = query.parse::<usize>() {
+        if n >= 1 && n <= models.len() {
+            return Some(n - 1);
+        }
+    }
+    let q = query.to_lowercase();
+    models
+        .iter()
+        .position(|m| m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q))
+}
+
+fn resolve_model(filter: Option<&str>, config_dir: Option<&Path>) -> Result<Model> {
+    let models = load_models_resolved(config_dir)?;
+    if models.is_empty() {
+        anyhow::bail!("No models configured.");
+    }
+    if let Some(f) = filter {
+        find_model_index(&models, f)
+            .map(|i| models[i].clone())
+            .with_context(|| format!("Model '{f}' not found in models.d/"))
+    } else {
+        Ok(models.into_iter().next().unwrap())
+    }
+}
+
+fn print_model_list(models: &[Model], current: Option<usize>) {
+    use std::collections::BTreeMap;
+    let mut groups: BTreeMap<&str, Vec<(usize, &Model)>> = BTreeMap::new();
+    for (i, m) in models.iter().enumerate() {
+        groups.entry(&m.provider).or_default().push((i, m));
+    }
+    eprintln!();
+    for (provider, entries) in &groups {
+        eprintln!("  {}", provider.bold().underline());
+        for (idx, m) in entries {
+            let mark = if Some(*idx) == current { "◀".green() } else { " ".normal() };
+            eprintln!("    {} {:2}. {} {}",
+                mark, idx + 1, m.name.cyan(), m.id.dimmed());
+        }
+    }
+    eprintln!();
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", &s[..max.saturating_sub(1)])
+    }
+}
+
+// ── Chat ─────────────────────────────────────────────────────────────
+
 async fn run_chat(
-    prompt: Option<String>, model_filter: Option<String>,
-    config: Option<PathBuf>, no_stream: bool, force_repl: bool,
-) -> anyhow::Result<()> {
+    prompt: Option<String>,
+    model_filter: Option<String>,
+    config_dir: Option<&Path>,
+    no_stream: bool,
+    force_repl: bool,
+) -> Result<()> {
     use std::io::{self, BufRead, IsTerminal, Read, Write};
 
-    // Decide mode: one-shot vs REPL
     let is_piped = !std::io::stdin().is_terminal();
     let enter_repl = force_repl || (prompt.is_none() && !is_piped);
 
     if enter_repl {
-        // ── Interactive REPL ──────────────────────────────────────────
-        // Load all models from config — used for /model switching and /models listing
-        let all_models = load_models_resolved(config.as_ref())?;
+        let all_models = load_models_resolved(config_dir)?;
         if all_models.is_empty() {
-            anyhow::bail!("No models found in config.");
+            anyhow::bail!("No models found in models.d/.");
         }
-        // Resolve which model to start with
         let model_idx = if let Some(ref filter) = model_filter {
-            find_model_index(&all_models, filter)
-                .ok_or_else(|| anyhow::anyhow!("Model '{}' not found. Use /models to list.", filter))?
+            find_model_index(&all_models, filter).with_context(|| {
+                format!("Model '{filter}' not found. Use /models to list.")
+            })?
         } else {
             0
         };
@@ -245,23 +371,29 @@ async fn run_chat(
         eprintln!("{}", "╔══════════════════════════════════════════╗".dimmed());
         eprintln!("{}", "║  latte chat — interactive REPL           ║".dimmed());
         eprintln!("{}", format!("║  Model: {:33} ║", truncate(&model.name, 33)).dimmed());
-        eprintln!("{}", format!("║  {} models  /exit  /clear  /model  /models║", all_models.len()).dimmed());
+        eprintln!(
+            "{}",
+            format!(
+                "║  {} models  /exit  /clear  /model  /models║",
+                all_models.len()
+            )
+            .dimmed()
+        );
         eprintln!("{}", "╚══════════════════════════════════════════╝".dimmed());
 
         let mut stdin = io::BufReader::new(io::stdin());
         loop {
-            // Prompt
             eprint!("\n{} ", "▶".cyan().bold());
             io::stderr().flush()?;
 
             let mut line = String::new();
             if stdin.read_line(&mut line)? == 0 {
-                break; // Ctrl+D
+                break;
             }
             let input = line.trim().to_string();
-            if input.is_empty() { continue; }
-
-            // Commands
+            if input.is_empty() {
+                continue;
+            }
             if input.starts_with('/') {
                 match input.as_str() {
                     "/exit" | "/quit" | "/q" => break,
@@ -277,7 +409,6 @@ async fn run_chat(
                     cmd if cmd == "/model" || cmd.starts_with("/model ") => {
                         let arg = cmd.strip_prefix("/model").unwrap().trim();
                         if arg.is_empty() {
-                            // No arg: show list
                             print_model_list(&all_models, Some(current_idx));
                             continue;
                         }
@@ -308,7 +439,6 @@ async fn run_chat(
                     }
                 }
             }
-            // Add user message to history, then call API
             history.push(Message { role: Role::User, content: input });
 
             eprint!("\n{} ", "◀".green().bold());
@@ -317,7 +447,10 @@ async fn run_chat(
             if no_stream {
                 let completion = client.chat(&history, &params).await?;
                 println!("{}", completion.content);
-                history.push(Message { role: Role::Assistant, content: completion.content.clone() });
+                history.push(Message {
+                    role: Role::Assistant,
+                    content: completion.content.clone(),
+                });
                 eprintln!("\n  {}", completion.usage);
             } else {
                 let mut stream = client.chat_stream(&history, &params).await?;
@@ -328,9 +461,11 @@ async fn run_chat(
                         StreamEvent::Delta { content, usage: u } => {
                             print!("{}", content);
                             full.push_str(&content);
-                            if let Some(u) = u { usage = u; }
+                            if let Some(u) = u {
+                                usage = u;
+                            }
                         }
-                        StreamEvent::Done { usage: u, .. } => { usage = u; }
+                        StreamEvent::Done { usage: u, .. } => usage = u,
                         StreamEvent::Error(e) => eprintln!("\n  {}", e.to_string().red()),
                     }
                 }
@@ -340,20 +475,19 @@ async fn run_chat(
         }
         eprintln!("\n  {}", "Goodbye!".dimmed());
     } else {
-        // ── One-shot mode ──────────────────────────────────────────────
         let prompt_text = match prompt {
             Some(p) if !p.is_empty() => p,
             _ => {
                 let mut buf = String::new();
                 io::stdin().read_to_string(&mut buf)?;
                 if buf.trim().is_empty() {
-                    anyhow::bail!("No prompt provided. Pass it as an argument, pipe via stdin, or run without args for REPL.");
+                    anyhow::bail!("No prompt provided.");
                 }
                 buf
             }
         };
 
-        let model = resolve_model(model_filter.as_deref(), config.as_ref())?;
+        let model = resolve_model(model_filter.as_deref(), config_dir)?;
         eprintln!("  Model: {} ({})", model.name.bold().cyan(), model.id.dimmed());
 
         let client = AiClient::new(model)?;
@@ -371,165 +505,62 @@ async fn run_chat(
                 match event {
                     StreamEvent::Delta { content, usage: u } => {
                         print!("{}", content);
-                        if let Some(u) = u { usage = u; }
+                        if let Some(u) = u {
+                            usage = u;
+                        }
                     }
-                    StreamEvent::Done { usage: u, .. } => { usage = u; }
+                    StreamEvent::Done { usage: u, .. } => usage = u,
                     StreamEvent::Error(e) => eprintln!("\n  {}", e.to_string().red()),
                 }
             }
             eprintln!("\n\n  {}", usage);
         }
     }
-
     Ok(())
 }
 
-/// Resolve which model to use: config or CLI args.
-fn resolve_model(filter: Option<&str>, config: Option<&PathBuf>) -> anyhow::Result<Model> {
-    let models = load_models_resolved(config)?;
-    if models.is_empty() {
-        anyhow::bail!("Config file has no models defined.");
-    }
-    if let Some(filter) = filter {
-        find_model_index(&models, filter)
-            .map(|i| models[i].clone())
-            .ok_or_else(|| anyhow::anyhow!("Model '{}' not found in config. Use --help to list.", filter))
-    } else {
-        Ok(models.into_iter().next().unwrap())
-    }
-}
+// ── Sweep ────────────────────────────────────────────────────────────
 
-/// Load all models from config.
-///
-/// If --config is specified, load only that file.
-/// Otherwise, merge global config (~/.latte/models.yaml) as base
-/// with project-local config overrides (by id).
-fn load_models_resolved(config: Option<&PathBuf>) -> anyhow::Result<Vec<Model>> {
-    if let Some(path) = config {
-        return load_models_from_config(path);
-    }
-
-    // Build merged model map: global base + project overrides
-    let mut map: std::collections::HashMap<String, Model> = std::collections::HashMap::new();
-
-    // 1. Load global config as base
-    for ext in &["yaml", "yml", "json", "toml"] {
-        let p = dot_config_path(ext);
-        if p.exists() {
-            eprintln!("  Global config: {}", p.display());
-            for m in load_models_from_config(&p)? {
-                map.insert(m.id.clone(), m);
-            }
-            break;
-        }
-    }
-    if map.is_empty() {
-        for ext in &["yaml", "yml", "json", "toml"] {
-            let p = xdg_config_path(ext);
-            if p.exists() {
-                eprintln!("  Global config: {}", p.display());
-                for m in load_models_from_config(&p)? {
-                    map.insert(m.id.clone(), m);
-                }
-                break;
-            }
-        }
-    }
-
-    // 2. Load project-local config as override
-    for candidate in &[
-        "latte.yaml", "latte.yml", "latte.json",
-        "models.yaml", "models.yml", "models.json",
-        "latte.toml", "models.toml",
-    ] {
-        let p = PathBuf::from(candidate);
-        if p.exists() {
-            eprintln!("  Project config: {}", p.display());
-            for m in load_models_from_config(&p)? {
-                map.insert(m.id.clone(), m); // override by id
-            }
-            break;
-        }
-    }
-
-    if map.is_empty() {
-        anyhow::bail!("No config found. Create ~/.latte/models.yaml or use --config.");
-    }
-
-    // Sort by provider then name for stable order
-    let mut models: Vec<Model> = map.into_values().collect();
-    models.sort_by(|a, b| a.provider.cmp(&b.provider).then(a.name.cmp(&b.name)));
-    Ok(models)
-}
-
-
-/// Find model by id/name substring or numeric index (1-based).
-fn find_model_index(models: &[Model], query: &str) -> Option<usize> {
-    // Try numeric index first (1-based)
-    if let Ok(n) = query.parse::<usize>() {
-        if n >= 1 && n <= models.len() {
-            return Some(n - 1);
-        }
-    }
-    // Substring match on id or name
-    let q = query.to_lowercase();
-    models.iter().position(|m| m.id.to_lowercase().contains(&q) || m.name.to_lowercase().contains(&q))
-}
-
-/// Print model list grouped by provider.
-fn print_model_list(models: &[Model], current: Option<usize>) {
-    use std::collections::BTreeMap;
-    // Group by provider
-    let mut groups: BTreeMap<&str, Vec<(usize, &Model)>> = BTreeMap::new();
-    for (i, m) in models.iter().enumerate() {
-        groups.entry(&m.provider).or_default().push((i, m));
-    }
-    eprintln!();
-    for (provider, entries) in &groups {
-        eprintln!("  {}", provider.bold().underline());
-        for (idx, m) in entries {
-            let mark = if Some(*idx) == current { "◀".green() } else { " ".normal() };
-            eprintln!("    {} {:2}. {} {}",
-                mark, idx + 1, m.name.cyan(), m.id.dimmed());
-        }
-    }
-    eprintln!();
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..max.saturating_sub(1)])
-    }
-}
 async fn run_sweep(
-    model_id: Option<String>, api: String, base_url: Option<String>, api_key: Option<String>,
-    provider: String, max_tokens: u32, context_window: u32, quick: bool,
-    prompt_filter: Option<String>, sweep_filter: Option<String>,
-    config: Option<PathBuf>,
-) -> anyhow::Result<()> {
-    let models = if let Some(config_path) = config {
-        load_models_from_config(&config_path)?
+    model_id: Option<String>,
+    api: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    provider: String,
+    max_tokens: u32,
+    context_window: u32,
+    quick: bool,
+    prompt_filter: Option<String>,
+    sweep_filter: Option<String>,
+    config_dir: Option<&Path>,
+) -> Result<()> {
+    let models = if let Some(dir) = config_dir {
+        load_models_resolved(Some(dir))?
     } else {
         match load_models_resolved(None) {
-            Ok(models) if !models.is_empty() => models,
+            Ok(m) if !m.is_empty() => m,
             _ => {
-                let id = model_id.ok_or_else(||
-                    anyhow::anyhow!("No model specified. Provide a model ID or create ~/.latte/models.yaml.")
-                )?;
+                let id = model_id.with_context(|| {
+                    "no model specified. Provide a model ID or populate models.d/"
+                })?;
                 vec![build_model(&id, &api, &base_url, &api_key, &provider, max_tokens, context_window)]
             }
         }
     };
 
     for model_cfg in &models {
-        println!("\n{}\n",
-            format!("Testing: {} ({})", model_cfg.name.bold().white(), model_cfg.id.dimmed()));
+        println!(
+            "\n{}\n",
+            format!("Testing: {} ({})", model_cfg.name.bold().white(), model_cfg.id.dimmed())
+        );
 
         let client = AiClient::new(model_cfg.clone())?;
         let test_prompts = filter_prompts(prompt_filter.as_deref());
-        let all_sweeps = if quick { sweeper::quick_sweep() } else { sweeper::programming_sweep() };
+        let all_sweeps = if quick {
+            sweeper::quick_sweep()
+        } else {
+            sweeper::programming_sweep()
+        };
         let sweeps = filter_sweeps(&all_sweeps, sweep_filter.as_deref());
 
         for sweep in &sweeps {
@@ -556,27 +587,44 @@ async fn run_sweep(
                 }
             }
 
-            println!("\n    {} Sweep total: {} prompts, {} in {}ms\n",
-                "📊".bold(), results.len(), total_usage.usage_string(),
-                results.iter().map(|r| r.duration_ms).sum::<u64>());
+            println!(
+                "\n    {} Sweep total: {} prompts, {} in {}ms\n",
+                "📊".bold(),
+                results.len(),
+                total_usage.usage_string(),
+                results.iter().map(|r| r.duration_ms).sum::<u64>()
+            );
         }
     }
-
     Ok(())
 }
 
+// ── Compare ──────────────────────────────────────────────────────────
+
 async fn run_compare(
-    model_id: String, api: String, base_url: Option<String>, api_key: Option<String>,
-    provider: String, max_tokens: u32, prompt_name: String,
-) -> anyhow::Result<()> {
-    let model = build_model(&model_id, &api, &base_url, &api_key, &provider, max_tokens, 65536);
+    model_id: String,
+    api: String,
+    base_url: Option<String>,
+    api_key: Option<String>,
+    provider: String,
+    max_tokens: u32,
+    prompt_name: String,
+    config_dir: Option<&Path>,
+) -> Result<()> {
+    let model = if let Some(dir) = config_dir {
+        resolve_model(Some(&model_id), Some(dir))?
+    } else {
+        build_model(&model_id, &api, &base_url, &api_key, &provider, max_tokens, 65536)
+    };
     let client = AiClient::new(model.clone())?;
 
     let test_prompts = prompts::all_prompts();
-    let tp = test_prompts.iter()
+    let tp = test_prompts
+        .iter()
         .find(|p| p.name == prompt_name)
-        .ok_or_else(|| anyhow::anyhow!(
-            "Prompt '{}' not found. Use `list-prompts` to see available prompts.", prompt_name))?;
+        .ok_or_else(|| {
+            anyhow::anyhow!("Prompt '{prompt_name}' not found. Use `list-prompts` to see available.")
+        })?;
 
     let sweeps = sweeper::programming_sweep();
     let mut all_results = Vec::new();
@@ -598,24 +646,23 @@ async fn run_compare(
 
     let comparison = report::format_comparison(&model.name, tp.name, &all_results);
     println!("{comparison}");
-
     Ok(())
 }
 
-// ── Helpers ────────────────────────────────────────────────────────────
+// ── Sweep helpers ────────────────────────────────────────────────────
 
 async fn run_test(
     client: &AiClient,
     messages: &[Message],
     params: &GenerateParams,
     prompt_name: &str,
-) -> anyhow::Result<sweeper::SweepResult> {
+) -> Result<SweepResult> {
     let start = Instant::now();
 
     match client.chat(messages, params).await {
         Ok(completion) => {
             let duration_ms = start.elapsed().as_millis() as u64;
-            Ok(sweeper::SweepResult {
+            Ok(SweepResult {
                 sweep_label: params.label(),
                 prompt_name: prompt_name.to_string(),
                 category: "test".to_string(),
@@ -629,7 +676,7 @@ async fn run_test(
         }
         Err(e) => {
             let duration_ms = start.elapsed().as_millis() as u64;
-            Ok(sweeper::SweepResult {
+            Ok(SweepResult {
                 sweep_label: params.label(),
                 prompt_name: prompt_name.to_string(),
                 category: "test".to_string(),
@@ -645,19 +692,24 @@ async fn run_test(
 }
 
 fn build_model(
-    model_id: &str, api: &str, base_url: &Option<String>,
-    api_key: &Option<String>, provider: &str,
-    max_tokens: u32, context_window: u32,
+    model_id: &str,
+    api: &str,
+    base_url: &Option<String>,
+    api_key: &Option<String>,
+    provider: &str,
+    max_tokens: u32,
+    context_window: u32,
 ) -> Model {
     let api_type = match api.to_lowercase().as_str() {
-        "anthropic" => ApiType::AnthropicMessages,
+        "anthropic" | "anthropic-messages" => ApiType::AnthropicMessages,
         _ => ApiType::OpenAiCompletions,
     };
     let default_base_url = match api_type {
         ApiType::OpenAiCompletions => "https://api.openai.com",
         ApiType::AnthropicMessages => "https://api.anthropic.com",
     };
-    let resolved_key = api_key.clone()
+    let resolved_key = api_key
+        .clone()
         .or_else(|| std::env::var("LATTE_API_KEY").ok())
         .unwrap_or_default();
 
@@ -676,12 +728,10 @@ fn build_model(
     }
 }
 
-fn filter_prompts(filter: Option<&str>) -> Vec<prompts::TestPrompt> {
+fn filter_prompts(filter: Option<&str>) -> Vec<TestPrompt> {
     let all = prompts::all_prompts();
     match filter {
-        Some(f) if !f.is_empty() => all.into_iter()
-            .filter(|p| p.name.contains(f))
-            .collect(),
+        Some(f) if !f.is_empty() => all.into_iter().filter(|p| p.name.contains(f)).collect(),
         _ => all,
     }
 }
@@ -691,275 +741,7 @@ fn filter_sweeps<'a>(
     filter: Option<&str>,
 ) -> Vec<&'a sweeper::ParamSweep> {
     match filter {
-        Some(f) if !f.is_empty() => sweeps.iter()
-            .filter(|s| s.label.contains(f))
-            .collect(),
+        Some(f) if !f.is_empty() => sweeps.iter().filter(|s| s.label.contains(f)).collect(),
         _ => sweeps.iter().collect(),
     }
-}
-
-fn load_models_from_config(path: &PathBuf) -> anyhow::Result<Vec<Model>> {
-    let content = std::fs::read_to_string(path)?;
-
-    #[derive(serde::Deserialize)]
-    struct ModelConfig {
-        models: Vec<ModelEntry>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct ModelEntry {
-        // ── 必填字段 ──────────────────────────────
-        /// 模型标识符 (e.g. "deepseek-chat")
-        id: String,
-        /// API 类型: "openai" | "anthropic"
-        api: String,
-        /// API 端点地址
-        base_url: String,
-
-        // ── 可选: 基本信息 ─────────────────────────
-        /// 人类可读的名称 (默认同 id)
-        name: Option<String>,
-        #[allow(dead_code)]
-        description: Option<String>,
-        /// 提供商名称 (e.g. "deepseek", "anthropic")
-        provider: Option<String>,
-
-        // ── 可选: 认证 ────────────────────────────
-        /// API 密钥，支持 ${ENV_VAR} 展开
-        api_key: Option<String>,
-
-        // ── 可选: 容量 ────────────────────────────
-        /// 上下文窗口大小 (token)，默认 65536
-        context_window: Option<u32>,
-        /// 最大输出 token 数，默认 4096
-        max_tokens: Option<u32>,
-
-        // ── 可选: 推理能力 ─────────────────────────
-        /// 是否支持思考/推理 (默认: anthropic API 自动为 true)
-        reasoning: Option<bool>,
-
-        // ── 可选: 成本 ────────────────────────────
-        /// 每百万输入 token 成本 (USD)
-        cost_per_million_input: Option<f64>,
-        /// 每百万输出 token 成本 (USD)
-        cost_per_million_output: Option<f64>,
-    }
-
-    // Auto-detect format by file extension
-    let cfg: ModelConfig = match path.extension().and_then(|e| e.to_str()) {
-        Some("yaml" | "yml") => serde_yaml::from_str(&content)?,
-        Some("json") => serde_json::from_str(&content)?,
-        _ => toml::from_str(&content)?,
-    };
-
-    let mut models = Vec::new();
-    for entry in &cfg.models {
-        let api_type = match entry.api.to_lowercase().as_str() {
-            "anthropic" | "anthropic-messages" => ApiType::AnthropicMessages,
-            _ => ApiType::OpenAiCompletions,
-        };
-        let resolved_key = resolve_env(&entry.api_key.clone().unwrap_or_default());
-        let raw_key = entry.api_key.as_deref().unwrap_or("");
-
-        // Warn if API key resolved to empty (env var not set)
-        if resolved_key.is_empty() && raw_key.starts_with("${") && raw_key.ends_with('}')
-            && raw_key != "ollama"
-        {
-            let var_name = &raw_key[2..raw_key.len() - 1];
-            eprintln!(
-                "  {} {}: {} — set with: export {}=\"...\"",
-                "⚠".yellow(),
-                entry.id,
-                format!("API key env var ${} not set", var_name).red(),
-                var_name,
-            );
-        }
-
-        models.push(Model {
-            id: entry.id.clone(),
-            name: entry.name.clone().unwrap_or_else(|| entry.id.clone()),
-            api: api_type,
-            provider: entry.provider.clone().unwrap_or_else(|| "custom".into()),
-            base_url: resolve_env(&entry.base_url),
-            api_key: resolved_key,
-            context_window: entry.context_window.unwrap_or(65536),
-            max_tokens: entry.max_tokens.unwrap_or(4096),
-            supports_thinking: entry.reasoning.unwrap_or(false)
-                || api_type == ApiType::AnthropicMessages,
-            cost_per_million_input: entry.cost_per_million_input.unwrap_or(0.0),
-            cost_per_million_output: entry.cost_per_million_output.unwrap_or(0.0),
-        });
-    }
-
-    Ok(models)
-}
-
-fn resolve_env(value: &str) -> String {
-    if value.starts_with("${") && value.ends_with('}') {
-        let var_name = &value[2..value.len() - 1];
-        std::env::var(var_name).unwrap_or_default()
-    } else {
-        value.to_string()
-    }
-}
-
-
-/// `~/.latte/models.{ext}`
-fn dot_config_path(ext: &str) -> PathBuf {
-    let filename = format!("models.{}", ext);
-    if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".latte").join(&filename)
-    } else {
-        PathBuf::from(".latte").join(&filename)
-    }
-}
-
-/// `$XDG_CONFIG_HOME/latte/models.{ext}` or `~/.config/latte/models.{ext}`
-fn xdg_config_path(ext: &str) -> PathBuf {
-    let filename = format!("models.{}", ext);
-    if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(dir).join("latte").join(&filename)
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".config").join("latte").join(&filename)
-    } else {
-        PathBuf::from(".config/latte").join(&filename)
-    }
-}
-// ── Vendors 子命令 ─────────────────────────────────────────────────
-
-/// 加载 vendor registry：显式 --config → cwd `vendors.toml` → `~/.latte/vendors.toml`
-fn load_vendors_registry(config: Option<&std::path::Path>) -> anyhow::Result<VendorRegistry> {
-    use anyhow::Context;
-    let candidates: Vec<std::path::PathBuf> = match config {
-        Some(p) => vec![p.to_path_buf()],
-        None => {
-            let cwd = std::path::PathBuf::from("vendors.toml");
-            let home = std::env::var_os("HOME")
-                .map(|h| std::path::PathBuf::from(h).join(".latte").join("vendors.toml"));
-            let mut v = vec![cwd];
-            if let Some(h) = home {
-                v.push(h);
-            }
-            v
-        }
-    };
-    for path in &candidates {
-        if path.exists() {
-            let s = std::fs::read_to_string(path)
-                .with_context(|| format!("read {}", path.display()))?;
-            return registry_from_toml_str(&s)
-                .with_context(|| format!("parse {}", path.display()));
-        }
-    }
-    anyhow::bail!(
-        "no vendors.toml found (tried: {})",
-        candidates
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
-/// `latte-tune vendors` 入口
-async fn run_vendors(action: VendorsAction, config: Option<PathBuf>) -> anyhow::Result<()> {
-    let reg = load_vendors_registry(config.as_deref())?;
-    match action {
-        VendorsAction::List => vendors_print_list(&reg),
-        VendorsAction::Status { id } => vendors_print_status(&reg, &id).await,
-        VendorsAction::Refresh { id } => vendors_print_refresh(&reg, &id).await,
-        VendorsAction::Discover { id } => vendors_print_discover(&reg, &id).await,
-    }
-}
-
-fn vendors_print_list(reg: &VendorRegistry) -> anyhow::Result<()> {
-    let vendors = reg.list();
-    if vendors.is_empty() {
-        println!("{}", "No vendors configured.".yellow());
-        return Ok(());
-    }
-    println!("{}", format!("Configured vendors ({}):", vendors.len()).bold());
-    for v in vendors {
-        let disabled = if v.disabled_features.is_empty() {
-            "-".dimmed().to_string()
-        } else {
-            v.disabled_features
-                .iter()
-                .map(|f| format!("{:?}", f).to_lowercase())
-                .collect::<Vec<_>>()
-                .join(",")
-        };
-        println!(
-            "  {} {} {} disabled=[{}]",
-            v.id.as_str().green().bold(),
-            v.base_url.dimmed(),
-            v.auth.kind().cyan(),
-            disabled
-        );
-    }
-    Ok(())
-}
-
-async fn vendors_print_status(reg: &VendorRegistry, id: &str) -> anyhow::Result<()> {
-    let vid = VendorId::new(id);
-    let s = reg
-        .status(&vid)
-        .await
-        .map_err(|e| anyhow::anyhow!("status({id}) failed: {e}"))?;
-    let token_remaining = match s.token_remaining_secs {
-        Some(secs) => format!("{secs}s"),
-        None => "never expires".to_string(),
-    };
-    let health_latency = match s.health_latency_ms {
-        Some(ms) => format!("{ms}ms"),
-        None => "n/a".to_string(),
-    };
-    println!("{}", format!("Vendor: {}", s.vendor.as_str()).bold());
-    println!("  auth_kind:    {}", s.auth_kind.cyan());
-    println!("  auth_valid:   {}", if s.auth_valid { "yes".green() } else { "no".red() });
-    println!("  token_left:   {token_remaining}");
-    println!("  health:       {} ({})", if s.health_ok { "ok".green() } else { "fail".red() }, health_latency);
-    if let Some(n) = s.discovered_models {
-        println!("  models:       {n}");
-    }
-    Ok(())
-}
-
-async fn vendors_print_refresh(reg: &VendorRegistry, id: &str) -> anyhow::Result<()> {
-    let vid = VendorId::new(id);
-    let token = reg
-        .refresh_now(&vid)
-        .await
-        .map_err(|e| anyhow::anyhow!("refresh({id}) failed: {e}"))?;
-    let masked = if token.len() > 8 {
-        format!("{}…{}", &token[..4], &token[token.len() - 4..])
-    } else {
-        token.clone()
-    };
-    println!("{} refreshed token: {}", "✓".green(), masked.cyan());
-    Ok(())
-}
-
-async fn vendors_print_discover(reg: &VendorRegistry, id: &str) -> anyhow::Result<()> {
-    let vid = VendorId::new(id);
-    let models = reg
-        .discover_models(&vid)
-        .await
-        .map_err(|e| anyhow::anyhow!("discover({id}) failed: {e}"))?;
-    if models.is_empty() {
-        println!("{}", "No models discovered.".yellow());
-        return Ok(());
-    }
-    println!(
-        "{}",
-        format!("Discovered {} model(s) from {}:", models.len(), id).bold()
-    );
-    for m in &models {
-        let ctx = match m.context_window {
-            Some(c) => format!("ctx={c}"),
-            None => "-".to_string(),
-        };
-        println!("  {} {} {}", m.id.green(), m.display_name.dimmed(), ctx.dimmed());
-    }
-    Ok(())
 }

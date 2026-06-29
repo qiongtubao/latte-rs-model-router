@@ -1,0 +1,15 @@
+[package]
+name = "latte-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Model catalog + priority-ordered route selection + circuit breaker"
+
+[dependencies]
+latte-ai = { path = "../latte-ai" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+serde = { workspace = true, features = ["derive"] }
+toml = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

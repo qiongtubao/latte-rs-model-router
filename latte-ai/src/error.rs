@@ -1,4 +1,3 @@
-use crate::vendor::VendorError;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -40,9 +39,4 @@ pub enum AiError {
     Other(String),
 }
 
-impl From<VendorError> for AiError {
-    fn from(e: VendorError) -> Self {
-        AiError::Other(format!("vendor: {e}"))
-    }
-}
 pub type Result<T> = std::result::Result<T, AiError>;

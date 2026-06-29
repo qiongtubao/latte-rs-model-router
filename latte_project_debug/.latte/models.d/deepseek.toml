@@ -1,0 +1,8 @@
+[[models]]
+id = "deepseek-v4-flash"
+api = "openai"
+provider = "deepseek"
+base_url = "https://api.deepseek.com"
+api_key = "${DEEPSEEK_API_KEY}"
+rate_limit_refresh_anchor        = "2026-06-29T00:00:00Z"
+rate_limit_refresh_interval_secs = 60

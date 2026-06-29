@@ -1,0 +1,27 @@
+# proxy.toml —— latte-model-proxy 启动配置
+#
+# 启动命令（在 latte_project_debug/ 目录下）:
+#   latte-model-proxy --config=./proxy.toml
+#
+# 或:
+#   cargo run -p latte-model-proxy -- --config=./proxy.toml
+
+[server]
+host = "127.0.0.1"
+port = 16434
+
+[catalog]
+# 项目级 models.d/（.latte/models.d 自动加载，无需写在这里）
+# 全局 ~/.latte/models.d/ 也会被加载（后加载 → 覆盖项目级）
+models_dir = "~/.latte/models.d"
+
+# 客户端发这个 model 字段时，proxy 静默按 pool 顺序挑选（调用方不知道）
+# 也可以直接发真实 model id（如 "deepseek-v4-flash"），proxy 直转
+proxy_default_model = "proxy-default"
+
+# 静默挑选的候选池（顺序 = 权重从大到小）
+pool = [
+    "glm-5.2",
+    "MiniMax-M3",
+    "deepseek-v4-flash",
+]

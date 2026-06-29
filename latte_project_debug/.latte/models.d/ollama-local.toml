@@ -1,0 +1,10 @@
+[[models]]
+id = "qwen2.5-coder-32b-instruct"
+api = "openai"
+provider = "ollama"
+base_url = "http://localhost:11434"
+api_key = "ollama"
+rate_limit_refresh_anchor        = "2026-06-29T00:00:00Z"
+rate_limit_refresh_interval_secs = 86400
+retry_count_5xx   = 2
+cooldown_5xx_secs = 30
