@@ -10,6 +10,13 @@
 //!
 //! Streaming (`stream: true` in the body) is supported: the proxy pipes the
 //! upstream's chunked body to the client without buffering.
+//!
+//! Operational:
+//! - `/health` (always 200) and `/ready` (200 / 503) for k8s probes.
+//! - Graceful shutdown on SIGINT / SIGTERM (drain in-flight requests).
+//! - `DefaultBodyLimit::max(10 MB)` on all routes to prevent OOM.
+//! - Optional proxy-level API key (set in `proxy.toml` `server.api_key`).
+//!   When set, `Authorization: Bearer <key>` is required for chat endpoints.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,8 +24,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
+use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router as AxumRouter};
@@ -30,6 +38,19 @@ use tracing::{debug, info, warn};
 use latte_ai::models::ApiType;
 use latte_router::{ModelEntry, Route, Router, RouterError};
 
+/// Hard cap on incoming request body. Chat-completion bodies are typically
+/// under 100 KB; 10 MB leaves headroom for large message arrays while
+/// preventing OOM from a malicious client.
+const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// Routes that require auth when `api_key` is configured. Probes + discovery
+/// stay public.
+const PROTECTED_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/messages",
+    "/api/chat",
+];
+
 /// Bundle of everything the proxy needs to serve requests.
 #[derive(Debug, Clone)]
 pub struct ServerRuntime {
@@ -39,6 +60,9 @@ pub struct ServerRuntime {
     pub proxy_default_model: String,
     /// Priority pool used when the client sends `proxy_default_model`.
     pub pool: Vec<String>,
+    /// Optional API key. When set, `Authorization: Bearer <key>` is required
+    /// for `PROTECTED_PATHS`.
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +77,7 @@ pub struct AppState {
     version: String,
     proxy_default_model: String,
     pool: Vec<String>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,12 +92,14 @@ impl Server {
 
     /// Test/embed convenience: build a server from just entries + version.
     /// Priority pool is empty; clients using `proxy-default` will get 503.
+    /// No API key configured.
     pub fn with_entries(entries: Vec<ModelEntry>, version: String) -> Self {
         Self::new(ServerRuntime {
             router: Arc::new(Router::with_system_clock(entries)),
             version,
             proxy_default_model: "proxy-default".to_string(),
             pool: Vec::new(),
+            api_key: None,
         })
     }
 
@@ -90,9 +117,12 @@ impl Server {
             version: self.runtime.version.clone(),
             proxy_default_model: self.runtime.proxy_default_model.clone(),
             pool: self.runtime.pool.clone(),
+            api_key: self.runtime.api_key.clone(),
         };
         AxumRouter::new()
             .route("/", get(root_handler).head(root_handler))
+            .route("/health", get(health_handler))
+            .route("/ready", get(ready_handler))
             .route("/api/version", get(version_handler))
             .route("/api/tags", get(ollama_tags_handler))
             .route("/api/show", post(ollama_show_handler))
@@ -100,21 +130,99 @@ impl Server {
             .route("/v1/models", get(openai_list_models_handler))
             .route("/v1/chat/completions", post(openai_chat_handler))
             .route("/v1/messages", post(anthropic_messages_handler))
+            .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+            .layer(from_fn_with_state(state.clone(), auth_middleware))
             .with_state(state)
     }
 
     pub async fn serve(&self, listener: TcpListener) -> std::io::Result<()> {
         let app = self.axum_router();
-        axum::serve(listener, app).await
+        info!(target: "latte_model_proxy", "server ready (graceful shutdown on SIGINT/SIGTERM)");
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+    }
+}
+
+/// Liveness probe — always 200 if the process is up.
+async fn health_handler() -> Response {
+    (StatusCode::OK, "ok\n").into_response()
+}
+
+/// Readiness probe — 200 if the catalog has models; 503 otherwise.
+async fn ready_handler(State(state): State<AppState>) -> Response {
+    if state.router.pool().is_empty() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not ready: no models in pool\n",
+        )
+            .into_response()
+    } else {
+        (StatusCode::OK, "ready\n").into_response()
+    }
+}
+
+/// Auth middleware: when `api_key` is configured, requests to protected
+/// routes must include `Authorization: Bearer <key>`. Other routes are
+/// always public.
+async fn auth_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let path = req.uri().path();
+    let needs_auth = PROTECTED_PATHS.contains(&path);
+
+    if needs_auth && state.api_key.is_some() {
+        let expected = state.api_key.as_deref().unwrap_or("");
+        let auth = req
+            .headers()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok());
+        let valid = auth
+            .and_then(|h| h.strip_prefix("Bearer ").map(str::trim))
+            .map(|t| t == expected)
+            .unwrap_or(false);
+        if !valid {
+            warn!(
+                target: "latte_model_proxy",
+                path = %path,
+                has_auth_header = auth.is_some(),
+                "auth failed (401)"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "invalid or missing api key" })),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
+}
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM (k8s shutdown). Used by
+/// `axum::serve(...).with_graceful_shutdown(...)` to drain in-flight requests.
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install SIGTERM handler")
+            .recv()
+            .await;
+    };
+    tokio::select! {
+        _ = ctrl_c => info!(target: "latte_model_proxy", "received SIGINT, shutting down"),
+        _ = terminate => info!(target: "latte_model_proxy", "received SIGTERM, shutting down"),
     }
 }
 
 async fn root_handler(State(state): State<AppState>) -> Response {
     let body = format!(
-        "latte-model-proxy {} is running\n  proxy_default_model: {}\n  pool: {}\n",
+        "latte-model-proxy {} is running\n  proxy_default_model: {}\n  pool: {}\n  api_key: {}\n",
         state.version,
         state.proxy_default_model,
         state.pool.join(", "),
+        if state.api_key.is_some() { "configured" } else { "none" },
     );
     let mut resp = (StatusCode::OK, body).into_response();
     resp.headers_mut().insert(
@@ -301,7 +409,6 @@ fn json_error(status: StatusCode, msg: String) -> Response {
 /// - `model == proxy_default_model` → silent priority selection (Router::select_candidates)
 /// - any other `model` → direct lookup (Router::select)
 /// - `body.stream == true` → stream the upstream response chunk-by-chunk
-///   (OpenAI SSE / Anthropic SSE / Ollama NDJSON all supported)
 async fn forward_passthrough(
     state: AppState,
     body: &str,
@@ -346,7 +453,6 @@ async fn forward_passthrough(
         }
     };
 
-    // Selection: magic name → silent priority; explicit name → direct lookup.
     let route: Route = if model == state.proxy_default_model {
         debug!(
             target: "latte_model_proxy",
@@ -447,9 +553,6 @@ async fn forward_passthrough(
         );
     }
 
-    // When the client used the magic name, the upstream API doesn't know
-    // "proxy-default" — replace the model field with the selected physical id
-    // so the upstream accepts the request.
     let mut body_to_send = parsed;
     if model == state.proxy_default_model {
         if let Some(obj) = body_to_send.as_object_mut() {
@@ -512,9 +615,6 @@ async fn forward_passthrough(
         .unwrap_or("application/json")
         .to_string();
 
-    // Streaming path: forward the upstream body chunk-by-chunk without
-    // buffering. The breaker is updated as soon as the status is known
-    // (reqwest::send() resolves with headers, before body).
     if stream_flag {
         let response_status = status.as_u16();
         state
@@ -542,7 +642,6 @@ async fn forward_passthrough(
         return out;
     }
 
-    // Non-streaming: buffer the full body and return.
     let bytes = match resp.bytes().await {
         Ok(b) => b,
         Err(e) => {

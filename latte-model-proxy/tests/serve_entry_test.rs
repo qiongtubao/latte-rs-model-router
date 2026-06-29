@@ -12,6 +12,7 @@ async fn serve_binds_to_configured_address_and_serves_root() {
     let runtime = ServerRuntime {
         router: std::sync::Arc::new(latte_router::Router::with_system_clock(vec![])),
         version: "test".to_string(),
+        api_key: None,
         proxy_default_model: "proxy-default".to_string(),
         pool: Vec::new(),
     };

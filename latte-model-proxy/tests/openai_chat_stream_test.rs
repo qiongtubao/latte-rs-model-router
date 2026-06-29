@@ -103,6 +103,7 @@ async fn stream_with_proxy_default_replaces_model_field_in_body() {
     let runtime = ServerRuntime {
         router: Arc::new(Router::with_system_clock(vec![entry])),
         version: "test".to_string(),
+        api_key: None,
         proxy_default_model: "proxy-default".to_string(),
         pool: vec!["glm-5.2".to_string()],
     };

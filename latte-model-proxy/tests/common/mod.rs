@@ -49,6 +49,7 @@ pub fn make_runtime_with_pool(entries: Vec<ModelEntry>, pool: Vec<String>) -> Se
     ServerRuntime {
         router: Arc::new(Router::with_system_clock(entries)),
         version: "test".to_string(),
+        api_key: None,
         proxy_default_model: "proxy-default".to_string(),
         pool,
     }

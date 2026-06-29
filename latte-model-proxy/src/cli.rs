@@ -39,6 +39,11 @@ pub struct Args {
     /// in priority order (first = highest).
     #[arg(long, value_delimiter = ',')]
     pub pool: Vec<String>,
+
+    /// Override `server.api_key` from proxy.toml. When set, clients must send
+    /// `Authorization: Bearer <key>` on chat endpoints.
+    #[arg(long)]
+    pub api_key: Option<String>,
 }
 
 impl Args {

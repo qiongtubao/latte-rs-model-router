@@ -35,6 +35,13 @@ pub struct ServerConfig {
 
     #[serde(default = "default_port")]
     pub port: u16,
+
+    /// Optional API key. When set, requests to `/v1/chat/completions`,
+    /// `/v1/messages`, and `/api/chat` must include `Authorization: Bearer <key>`.
+    /// Other routes (`/health`, `/ready`, `/v1/models`, `/`) are always exempt
+    /// so probes and discovery work without auth.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -42,6 +49,7 @@ impl Default for ServerConfig {
         Self {
             host: default_host(),
             port: default_port(),
+            api_key: None,
         }
     }
 }

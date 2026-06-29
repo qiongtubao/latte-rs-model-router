@@ -52,10 +52,11 @@ async fn main() -> Result<()> {
 
     let host = args.host.clone().unwrap_or(proxy_cfg.server.host);
     let port = args.port.unwrap_or(proxy_cfg.server.port);
+    let api_key: Option<String> = args.api_key.clone().or(proxy_cfg.server.api_key.clone());
     let proxy_default_model = args
         .proxy_default_model
         .clone()
-        .unwrap_or_else(|| proxy_cfg.catalog.proxy_default_model.clone());
+        .unwrap_or(proxy_cfg.catalog.proxy_default_model.clone());
     let pool = if !args.pool.is_empty() {
         args.pool.clone()
     } else {
@@ -67,7 +68,6 @@ async fn main() -> Result<()> {
         .unwrap_or(proxy_cfg.catalog.models_dir);
     let models_dir = resolve_tilde(&models_dir_str);
 
-    // Load catalog: project layer (./.latte/models.d) then user layer.
     let mut catalog = ModelCatalog::new();
     let project_dir = PathBuf::from(".latte/models.d");
     let _ = catalog.load_dir(&project_dir);
@@ -84,8 +84,6 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Validate pool references against the catalog. Start-up error if any
-    // pool id is unknown — fail fast rather than silently dropping at runtime.
     let mut pool_missing: Vec<&str> = Vec::new();
     for id in &pool {
         if catalog.get(id).is_none() {
@@ -99,8 +97,6 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Router pool = all catalog models. The client may send any of them
-    // directly via `model = "<id>"`; the proxy uses Router::select for that.
     let router_pool: Vec<ModelEntry> = catalog
         .ids()
         .map(|id| catalog.get(id).expect("just enumerated").clone())
@@ -110,6 +106,7 @@ async fn main() -> Result<()> {
         target: "latte_model_proxy",
         proxy_default_model = %proxy_default_model,
         pool = ?pool,
+        api_key_configured = api_key.is_some(),
         "priority pool (silent selection)"
     );
 
@@ -129,6 +126,7 @@ async fn main() -> Result<()> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         proxy_default_model,
         pool,
+        api_key,
     };
     let server = Server::new(runtime);
     server.serve(listener).await?;
