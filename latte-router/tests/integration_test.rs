@@ -1,13 +1,12 @@
 //! Integration tests for `latte-router` — catalog loading, selection, breaker.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::AtomicI64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use latte_ai::models::ApiType;
-
-use latte_router::{Clock, ModelCatalog, ModelEntry, Router, RouterError, SystemClock};
+use latte_router::{Availability, Clock, ModelCatalog, ModelEntry, Router, RouterError, SystemClock};
 
 #[derive(Debug)]
 struct MockClock {
@@ -15,48 +14,32 @@ struct MockClock {
 }
 
 impl MockClock {
-    fn new(initial: chrono::DateTime<Utc>) -> Self {
-        Self {
-            current: AtomicI64::new(initial.timestamp()),
-        }
+    fn new(t0: DateTime<Utc>) -> Self {
+        Self { current: AtomicI64::new(t0.timestamp()) }
     }
-
     fn advance(&self, secs: i64) {
         self.current.fetch_add(secs, Ordering::SeqCst);
     }
 }
 
 impl Clock for MockClock {
-    fn now(&self) -> chrono::DateTime<Utc> {
+    fn now(&self) -> DateTime<Utc> {
         Utc.timestamp_opt(self.current.load(Ordering::SeqCst), 0).unwrap()
     }
 }
 
-fn make_entry(
-    id: &str,
-    anchor: chrono::DateTime<Utc>,
-    interval: u64,
-    threshold: u32,
-    cooldown: u64,
-) -> ModelEntry {
+fn make_entry(id: &str, anchor: DateTime<Utc>, interval: u64, threshold: u32, cooldown: u64) -> ModelEntry {
     ModelEntry {
-        id: id.to_string(),
-        name: None,
-        api: ApiType::OpenAiCompletions,
-        provider: "test".to_string(),
-        base_url: "http://test".to_string(),
-        api_key: "k".to_string(),
-        context_window: 65536,
-        max_tokens: 4096,
-        rate_limit_refresh_anchor: anchor,
-        rate_limit_refresh_interval_secs: interval,
-        retry_count_5xx: threshold,
-        cooldown_5xx_secs: cooldown,
-        retry_on: vec![403],
-        retry_on_count: 10,
-        retry_on_cooldown_secs: 600,
+        id: id.to_string(), name: None, api: ApiType::OpenAiCompletions,
+        provider: "test".to_string(), base_url: "http://test".to_string(), api_key: "k".to_string(),
+        context_window: 65536, max_tokens: 4096,
+        rate_limit_refresh_anchor: anchor, rate_limit_refresh_interval_secs: interval,
+        retry_count_5xx: threshold, cooldown_5xx_secs: cooldown,
+        retry_on: vec![403], retry_on_count: 10, retry_on_cooldown_secs: 600,
     }
 }
+
+// ==================== basic selection ====================
 
 #[test]
 fn select_returns_requested_model_when_available() {
@@ -74,6 +57,8 @@ fn select_unknown_model_returns_error() {
     assert!(matches!(err, RouterError::UnknownModel(s) if s == "unknown"));
 }
 
+// ==================== breaker / pull-out / fallback ====================
+
 #[test]
 fn select_falls_back_to_next_pool_member_when_requested_is_cooling() {
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
@@ -81,9 +66,7 @@ fn select_falls_back_to_next_pool_member_when_requested_is_cooling() {
     let a = make_entry("a", t0, 60, 5, 600);
     let b = make_entry("b", t0, 60, 5, 600);
     let router = Router::new(vec![a, b], clock);
-
     router.record("a", 429, None);
-
     let route = router.select("a").unwrap();
     assert_eq!(route.model_id, "b");
 }
@@ -92,17 +75,12 @@ fn select_falls_back_to_next_pool_member_when_requested_is_cooling() {
 fn record_429_with_retry_after_overrides_next_refresh() {
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     let clock = Arc::new(MockClock::new(t0));
-    // interval = 60s; next_refresh(now) = t0 (since now == anchor)
     let a = make_entry("a", t0, 60, 5, 600);
     let router = Router::new(vec![a], clock.clone());
-
-    // 429 with retry_after=120s; max(t0, t0+120) = t0+120
     router.record("a", 429, Some(120));
-
     clock.advance(60);
     let err = router.select("a").unwrap_err();
     assert!(matches!(err, RouterError::AllUnavailable { .. }));
-
     clock.advance(61);
     let route = router.select("a").unwrap();
     assert_eq!(route.model_id, "a");
@@ -112,14 +90,10 @@ fn record_429_with_retry_after_overrides_next_refresh() {
 fn record_429_without_retry_after_uses_next_refresh() {
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     let clock = Arc::new(MockClock::new(t0));
-    // interval = 100s; next_refresh(t0) = t0, next_refresh(t0+30) = t0+100
     let a = make_entry("a", t0, 100, 5, 600);
     let router = Router::new(vec![a], clock.clone());
-
-    // At t0+30, no Retry-After → next_refresh = t0+100 (70s away)
     clock.advance(30);
     router.record("a", 429, None);
-
     let err = router.select("a").unwrap_err();
     if let RouterError::AllUnavailable { retry_after_secs } = err {
         assert_eq!(retry_after_secs, 70);
@@ -135,12 +109,10 @@ fn record_5xx_opens_breaker_after_threshold() {
     let a = make_entry("a", t0, 60, 3, 600);
     let b = make_entry("b", t0, 60, 3, 600);
     let router = Router::new(vec![a, b], clock);
-
     router.record("a", 500, None);
     router.record("a", 503, None);
     let route = router.select("a").unwrap();
     assert_eq!(route.model_id, "a");
-
     router.record("a", 502, None);
     let route = router.select("a").unwrap();
     assert_eq!(route.model_id, "b");
@@ -152,13 +124,11 @@ fn record_success_resets_5xx_counter() {
     let clock = Arc::new(MockClock::new(t0));
     let a = make_entry("a", t0, 60, 3, 600);
     let router = Router::new(vec![a], clock);
-
     router.record("a", 500, None);
     router.record("a", 500, None);
     router.record("a", 200, None);
     router.record("a", 500, None);
     router.record("a", 500, None);
-
     let route = router.select("a").unwrap();
     assert_eq!(route.model_id, "a");
 }
@@ -170,10 +140,8 @@ fn all_pool_members_cooling_returns_all_unavailable_with_min_retry() {
     let a = make_entry("a", t0, 60, 1, 60);
     let b = make_entry("b", t0, 60, 1, 120);
     let router = Router::new(vec![a, b], clock);
-
     router.record("a", 500, None);
     router.record("b", 500, None);
-
     let err = router.select("a").unwrap_err();
     if let RouterError::AllUnavailable { retry_after_secs } = err {
         assert_eq!(retry_after_secs, 60);
@@ -186,11 +154,8 @@ fn all_pool_members_cooling_returns_all_unavailable_with_min_retry() {
 fn record_403_below_threshold_does_not_pull_out() {
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     let clock = Arc::new(MockClock::new(t0));
-    // retry_count_5xx=5 cooldown_5xx_secs=600
-    let a = make_entry("a", t0, 60, 5, 600);  // retry_count_403=10, cooldown_403_secs=600
+    let a = make_entry("a", t0, 60, 5, 600);
     let router = Router::new(vec![a], clock.clone());
-
-    // 9 consecutive 403s → below threshold, model still available
     for _ in 0..9 {
         router.record("a", 403, None);
     }
@@ -204,20 +169,12 @@ fn record_403_after_threshold_pulls_out_model() {
     let a = make_entry("a", t0, 60, 5, 600);
     let b = make_entry("b", t0, 60, 5, 600);
     let router = Router::new(vec![a, b], clock.clone());
-
-    // 10 consecutive 403s → threshold reached (default=10), pull out
     for _ in 0..10 {
         router.record("a", 403, None);
     }
-
-    // select("a") should fallback to b
     let route = router.select("a").unwrap();
     assert_eq!(route.model_id, "b");
-
-    // select_candidates also skips a
-    let route = router
-        .select_candidates(&["a".to_string(), "b".to_string()])
-        .unwrap();
+    let route = router.select_candidates(&["a".to_string(), "b".to_string()]).unwrap();
     assert_eq!(route.model_id, "b");
 }
 
@@ -227,164 +184,331 @@ fn record_403_counter_resets_on_success() {
     let clock = Arc::new(MockClock::new(t0));
     let a = make_entry("a", t0, 60, 5, 600);
     let router = Router::new(vec![a], clock.clone());
-
-    // 9 403s + 1 success → counter resets
     for _ in 0..9 {
         router.record("a", 403, None);
     }
-    router.record("a", 200, None);  // resets counter
-    router.record("a", 403, None);  // should be count 1 again, not 10
-
+    router.record("a", 200, None);
+    router.record("a", 403, None);
     assert!(router.select("a").is_ok());
 }
 
+// ==================== half-open + warmup lifecycle ====================
+
+/// 探针成功后进入 Warmup（非直接 Closed），连续 5 次成功后恢复
 #[test]
-fn after_cooldown_model_returns_to_pool() {
+fn probe_success_enters_warmup_then_recovers() {
     let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     let clock = Arc::new(MockClock::new(t0));
     let a = make_entry("a", t0, 60, 1, 30);
     let b = make_entry("b", t0, 60, 1, 30);
     let router = Router::new(vec![a, b], clock.clone());
 
+    // 拉出 a
     router.record("a", 500, None);
-    let route = router.select("a").unwrap();
+    assert_eq!(router.breaker_state("a"), "Open");
+
+    // 冷却到期 → HalfOpen
+    clock.advance(31);
+    let _avail = router.check_availability("a");
+    assert_eq!(router.breaker_state("a"), "HalfOpen");
+
+    // 放行探针，探针成功 → Warmup
+    let _route = router.select("a").unwrap();
+    router.record("a", 200, None);
+    assert_eq!(router.breaker_state("a"), "Warmup");
+
+    // Warmup 阶段权重低，select_candidates 应选 Closed 的 b
+    let route = router.select_candidates(&["a".to_string(), "b".to_string()]).unwrap();
     assert_eq!(route.model_id, "b");
 
+    // 连续成功 4 次（第 2-5 次）→ Closed
+    for _ in 0..4 {
+        router.record("a", 200, None);
+    }
+    assert_eq!(router.breaker_state("a"), "Closed");
+
+    // 恢复到 Closed，select_candidates 应选 a（优先级高）
+    let route = router.select_candidates(&["a".to_string(), "b".to_string()]).unwrap();
+    assert_eq!(route.model_id, "a");
+}
+
+/// Warmup 阶段失败 → 回到 Open
+#[test]
+fn warmup_failure_reopens_breaker() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 1, 30);
+    let b = make_entry("b", t0, 60, 1, 30);
+    let router = Router::new(vec![a, b], clock.clone());
+
+    // 拉出 → HalfOpen → 探针成功 → Warmup
+    router.record("a", 500, None);
     clock.advance(31);
+    let _avail = router.check_availability("a");
+    let _route = router.select("a").unwrap();
+    router.record("a", 200, None);
+    assert_eq!(router.breaker_state("a"), "Warmup");
+
+    // Warmup 阶段失败 → 回到 Open
+    router.record("a", 429, None);
+    assert_eq!(router.breaker_state("a"), "Open");
+}
+
+/// `select` 支持 Warmup 状态（精确选模型时可选中 warmup 模型）
+#[test]
+fn select_works_in_warmup_state() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 1, 30);
+    let router = Router::new(vec![a], clock.clone());
+
+    router.record("a", 500, None);
+    clock.advance(31);
+    let _avail = router.check_availability("a");
+    let _route = router.select("a").unwrap();
+    router.record("a", 200, None);
+    assert_eq!(router.breaker_state("a"), "Warmup");
+
+    // select("a") 在 warmup 下仍然可用
     let route = router.select("a").unwrap();
     assert_eq!(route.model_id, "a");
 }
 
+/// 无 Closed 模型时，优先放行探针（weight=99 > warmup=5）
+#[test]
+fn probe_has_higher_priority_than_warmup() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 1, 30); // 被拉出 → HalfOpen
+    let b = make_entry("b", t0, 60, 1, 30); // Warmup(降权)
+    let router = Router::new(vec![a, b], clock.clone());
+
+    // b 进入 Warmup
+    router.record("b", 500, None);
+    clock.advance(31);
+    let _avail = router.check_availability("b");
+    let _route = router.select("b").unwrap();
+    router.record("b", 200, None);
+    assert_eq!(router.breaker_state("b"), "Warmup");
+
+    // a 被拉出进入 HalfOpen
+    router.record("a", 500, None);
+    clock.advance(31);
+    let _avail = router.check_availability("a");
+    assert_eq!(router.breaker_state("a"), "HalfOpen");
+
+    // 没有 Closed 模型时，ProbeAllowed(99) > Warmup(5)
+    // 应选 a（放行探针）而非 b（warmup 中）
+    let route = router.select_candidates(&["a".to_string(), "b".to_string()]).unwrap();
+    assert_eq!(route.model_id, "a");
+}
+
+// ==================== half-open probe (basics) ====================
+
+#[test]
+fn halfopen_only_one_probe_allowed_at_a_time() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 1, 30);
+    let b = make_entry("b", t0, 60, 1, 30);
+    let router = Router::new(vec![a, b], clock.clone());
+    router.record("a", 500, None);
+    clock.advance(31);
+    let _avail = router.check_availability("a");
+    let route = router.select("a").unwrap();
+    assert_eq!(route.model_id, "a");
+    assert_eq!(router.breaker_state("a"), "HalfOpen");
+    // 第二个请求 fallback 到 b（探针在飞）
+    let route = router.select("a").unwrap();
+    assert_eq!(route.model_id, "b");
+}
+
+#[test]
+fn halfopen_probe_failure_reopens_breaker() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 1, 30);
+    let b = make_entry("b", t0, 60, 1, 30);
+    let router = Router::new(vec![a, b], clock.clone());
+    router.record("a", 500, None);
+    clock.advance(31);
+    let _avail = router.check_availability("a");
+    let route = router.select("a").unwrap();
+    assert_eq!(route.model_id, "a");
+    // 探针失败
+    router.record("a", 500, None);
+    assert_eq!(router.breaker_state("a"), "Open");
+    let route = router.select("a").unwrap();
+    assert_eq!(route.model_id, "b");
+}
+
+// ==================== exponential backoff ====================
+
+#[test]
+fn probe_failure_triggers_exponential_backoff() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 1, 30);
+    let router = Router::new(vec![a], clock.clone());
+    // 第一次 429：pull_out → backoff_secs=60
+    router.record("a", 429, None);
+    clock.advance(61);
+    let _avail = router.check_availability("a");
+    assert_eq!(router.breaker_state("a"), "HalfOpen");
+    // 放行探针，探针 429 失败 → pull_out_with_backoff → backoff=120
+    let _route = router.select("a").unwrap();
+    router.record("a", 429, None);
+    assert_eq!(router.breaker_state("a"), "Open");
+    clock.advance(120);
+    let _avail = router.check_availability("a");
+    assert_eq!(router.breaker_state("a"), "HalfOpen");
+    // 探针成功 → Warmup
+    let _route = router.select("a").unwrap();
+    router.record("a", 200, None);
+    assert_eq!(router.breaker_state("a"), "Warmup");
+    // 连续成功 4 次 → Closed
+    for _ in 0..4 {
+        router.record("a", 200, None);
+    }
+    assert_eq!(router.breaker_state("a"), "Closed");
+    // 再次 429，backoff 已重置
+    router.record("a", 429, None);
+    clock.advance(61);
+    let _avail = router.check_availability("a");
+    assert_eq!(_avail, Availability::ProbeAllowed { since: clock.now() });
+}
+
+#[test]
+fn non_probe_5xx_uses_config_cooldown() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let a = make_entry("a", t0, 60, 1, 30);
+    let router = Router::new(vec![a], clock.clone());
+    router.record("a", 500, None);
+    assert_eq!(router.breaker_state("a"), "Open");
+    clock.advance(29);
+    assert_eq!(router.check_availability("a"), Availability::Unavailable);
+    clock.advance(2);
+    let avail = router.check_availability("a");
+    assert_eq!(avail, Availability::ProbeAllowed { since: clock.now() });
+}
+
+#[test]
+fn non_probe_403_uses_retry_on_cooldown() {
+    let t0 = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
+    let clock = Arc::new(MockClock::new(t0));
+    let mut a = make_entry("a", t0, 60, 1, 30);
+    a.retry_on_count = 1;
+    a.retry_on_cooldown_secs = 30;
+    let router = Router::new(vec![a], clock.clone());
+    router.record("a", 403, None);
+    assert_eq!(router.breaker_state("a"), "Open");
+    clock.advance(29);
+    assert_eq!(router.check_availability("a"), Availability::Unavailable);
+    clock.advance(2);
+    let avail = router.check_availability("a");
+    assert_eq!(avail, Availability::ProbeAllowed { since: clock.now() });
+}
+
+// ==================== catalog ====================
+
 #[test]
 fn catalog_loads_toml_files_from_dir() {
-    let dir = std::env::temp_dir().join(format!("latte-router-test-{}", std::process::id()));
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("latte_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-
-    let path = dir.join("anthropic.toml");
-    std::fs::write(
-        &path,
-        r#"
+    let f1 = dir.join("01-openai.toml");
+    std::fs::write(&f1, r#"
 [[models]]
-id = "claude-sonnet-4-20250514"
-name = "Claude Sonnet 4"
-api = "anthropic"
+id = "gpt-4"
+api = "openai-completions"
+provider = "openai"
+base_url = "https://api.openai.com"
+api_key = "sk-xxx"
+"#).unwrap();
+    let f2 = dir.join("02-anthropic.toml");
+    std::fs::write(&f2, r#"
+[[models]]
+id = "claude-opus"
+api = "anthropic-messages"
 provider = "anthropic"
 base_url = "https://api.anthropic.com"
-api_key = "k-test"
-context_window = 200000
-max_tokens = 8192
-"#,
-    )
-    .unwrap();
-
-    let mut catalog = ModelCatalog::new();
-    let count = catalog.load_dir(&dir).unwrap();
-    assert_eq!(count, 1);
-    let entry = catalog.get("claude-sonnet-4-20250514").unwrap();
-    assert_eq!(entry.display_name(), "Claude Sonnet 4");
-    assert_eq!(entry.api_key, "k-test");
-    assert_eq!(entry.context_window, 200000);
-
-    std::fs::remove_dir_all(&dir).ok();
+api_key = "sk-xxx"
+"#).unwrap();
+    let mut cat = ModelCatalog::new();
+    let n = cat.load_dir(&dir).unwrap();
+    assert_eq!(n, 2);
+    assert!(cat.get("gpt-4").is_some());
+    assert!(cat.get("claude-opus").is_some());
+    assert_eq!(cat.get("gpt-4").unwrap().api, ApiType::OpenAiCompletions);
+    assert_eq!(cat.get("claude-opus").unwrap().api, ApiType::AnthropicMessages);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn catalog_expands_env_var_in_api_key() {
-    std::env::set_var("LATTE_TEST_KEY", "secret-123");
-    let dir = std::env::temp_dir().join(format!("latte-router-env-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-
-    let path = dir.join("a.toml");
-    std::fs::write(
-        &path,
-        r#"
-[[models]]
-id = "a"
-api = "openai"
+    std::env::set_var("LATTE_TEST_KEY", "env-val");
+    let toml_str = r#"[[models]]
+id = "m"
+api = "openai-completions"
 provider = "p"
-base_url = "http://x"
-api_key = "${LATTE_TEST_KEY}"
-"#,
-    )
-    .unwrap();
-
-    let mut catalog = ModelCatalog::new();
-    catalog.load_dir(&dir).unwrap();
-    let entry = catalog.get("a").unwrap();
-    assert_eq!(entry.api_key, "secret-123");
-
-    std::env::remove_var("LATTE_TEST_KEY");
-    std::fs::remove_dir_all(&dir).ok();
+base_url = "http://u"
+api_key = "${LATTE_TEST_KEY}""#;
+    let mut cat = ModelCatalog::new();
+    let dir = std::env::temp_dir();
+    let f = dir.join("test_expand.toml");
+    std::fs::write(&f, toml_str).unwrap();
+    cat.load_file(&f).unwrap();
+    let _ = std::fs::remove_file(&f);
+    assert_eq!(cat.get("m").unwrap().api_key, "env-val");
 }
 
 #[test]
 fn catalog_load_dir_silent_skip_for_missing_dir() {
-    let mut catalog = ModelCatalog::new();
-    let count = catalog
-        .load_dir(&PathBuf::from("/nonexistent/path/xyz"))
-        .unwrap();
-    assert_eq!(count, 0);
+    let mut dir = std::env::temp_dir();
+    dir.push("nonexistent_latte_test_dir_12345");
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut cat = ModelCatalog::new();
+    let n = cat.load_dir(&dir).unwrap();
+    assert_eq!(n, 0);
 }
 
 #[test]
 fn catalog_merge_later_overrides_earlier() {
-    let dir1 = std::env::temp_dir().join(format!("latte-router-m1-{}", std::process::id()));
-    let dir2 = std::env::temp_dir().join(format!("latte-router-m2-{}", std::process::id()));
-    std::fs::create_dir_all(&dir1).unwrap();
-    std::fs::create_dir_all(&dir2).unwrap();
-
-    std::fs::write(
-        dir1.join("a.toml"),
-        r#"
-[[models]]
-id = "a"
-api = "openai"
-provider = "p"
-base_url = "http://base1"
-api_key = "k1"
-"#,
-    )
-    .unwrap();
-    std::fs::write(
-        dir2.join("a.toml"),
-        r#"
-[[models]]
-id = "a"
-api = "openai"
-provider = "p"
-base_url = "http://base2"
-api_key = "k2"
-"#,
-    )
-    .unwrap();
-
-    let mut catalog = ModelCatalog::new();
-    catalog.load_dir(&dir1).unwrap();
-    catalog.load_dir(&dir2).unwrap();
-    assert_eq!(catalog.get("a").unwrap().base_url, "http://base2");
-    assert_eq!(catalog.get("a").unwrap().api_key, "k2");
-
-    std::fs::remove_dir_all(&dir1).ok();
-    std::fs::remove_dir_all(&dir2).ok();
+    let a = ModelEntry {
+        id: "m".to_string(), name: None, api: ApiType::OpenAiCompletions,
+        provider: "p1".to_string(), base_url: "http://a".to_string(), api_key: "k1".to_string(),
+        context_window: 65536, max_tokens: 4096,
+        rate_limit_refresh_anchor: Utc.timestamp_opt(0, 0).unwrap(), rate_limit_refresh_interval_secs: 60,
+        retry_count_5xx: 5, cooldown_5xx_secs: 600,
+        retry_on: vec![403], retry_on_count: 10, retry_on_cooldown_secs: 600,
+    };
+    let b = ModelEntry { provider: "p2".to_string(), base_url: "http://b".to_string(), api_key: "k2".to_string(), ..a.clone() };
+    let cat1 = ModelCatalog::from_entries(vec![a]);
+    let cat2 = ModelCatalog::from_entries(vec![b]);
+    let mut merged = cat1.clone();
+    merged.merge(cat2);
+    let m = merged.get("m").unwrap();
+    assert_eq!(m.provider, "p2");
+    assert_eq!(m.base_url, "http://b");
+    assert_eq!(m.api_key, "k2");
 }
+
+// ==================== next_refresh ====================
 
 #[test]
 fn next_refresh_returns_strictly_future_time() {
     let anchor = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
-    let entry = make_entry("a", anchor, 300, 5, 600);
-
-    // now = anchor → first cycle strictly after now, returns anchor + 300
-    assert_eq!(entry.next_refresh(anchor), anchor + chrono::Duration::seconds(300));
-
-    // now = anchor + 1s → still first cycle, returns anchor + 300
-    let t1 = anchor + chrono::Duration::seconds(1);
-    assert_eq!(entry.next_refresh(t1), anchor + chrono::Duration::seconds(300));
-
-    // now = anchor + 300s (exactly on a cycle) → next cycle, returns anchor + 600
-    let t2 = anchor + chrono::Duration::seconds(300);
-    assert_eq!(entry.next_refresh(t2), anchor + chrono::Duration::seconds(600));
-
-    // now = anchor + 450s → mid second cycle, returns anchor + 600
-    let t3 = anchor + chrono::Duration::seconds(450);
-    assert_eq!(entry.next_refresh(t3), anchor + chrono::Duration::seconds(600));
+    let entry = make_entry("m", anchor, 100, 5, 600);
+    let next = entry.next_refresh(anchor);
+    assert_eq!(next, Utc.timestamp_opt(1_700_000_100, 0).unwrap());
+    let now2 = Utc.timestamp_opt(1_700_000_050, 0).unwrap();
+    let next2 = entry.next_refresh(now2);
+    assert_eq!(next2, Utc.timestamp_opt(1_700_000_100, 0).unwrap());
+    let now3 = Utc.timestamp_opt(1_700_000_250, 0).unwrap();
+    let next3 = entry.next_refresh(now3);
+    assert_eq!(next3, Utc.timestamp_opt(1_700_000_300, 0).unwrap());
+    let entry_z = make_entry("m", anchor, 0, 5, 600);
+    assert_eq!(entry_z.next_refresh(now3), now3);
 }

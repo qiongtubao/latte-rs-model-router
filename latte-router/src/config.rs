@@ -71,7 +71,7 @@ fn default_retry_on_count() -> u32 {
     10
 }
 fn default_retry_on_cooldown() -> u64 {
-    600 // 10 minutes
+    60 // 1 min
 }
 fn default_srv_threshold() -> u32 {
     5

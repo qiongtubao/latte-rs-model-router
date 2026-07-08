@@ -1,8 +1,10 @@
 //! Route selection: walk the pool from the requested model, skipping cooldown.
+//!
+//! Supports circuit breaker states: Closed, Warmup (降权), HalfOpen (探针).
 
 use chrono::{DateTime, Utc};
 
-use crate::breaker::CircuitBreaker;
+use crate::breaker::{Availability, CircuitBreaker};
 use crate::config::{ModelEntry, Route, RouterError};
 
 pub struct RouteSelector<'a> {
@@ -19,8 +21,9 @@ impl<'a> RouteSelector<'a> {
     /// Resolve a request for `model` to a `Route`.
     ///
     /// Finds `model` in the pool and walks forward, returning the first entry
-    /// whose breaker is closed. If every entry from `model`'s position onward
-    /// is cooling, returns [`RouterError::AllUnavailable`].
+    /// whose breaker is available (Closed, Warmup, or HalfOpen probe allowed).
+    /// If the selected entry is a HalfOpen probe, `record_probe_sent()` is
+    /// called to lock the probe state.
     pub fn select(&self, model: &str) -> Result<Route, RouterError> {
         let start = match self.pool.iter().position(|m| m.id == model) {
             Some(idx) => idx,
@@ -28,8 +31,17 @@ impl<'a> RouteSelector<'a> {
         };
 
         for entry in &self.pool[start..] {
-            if self.breaker.is_available(&entry.id, self.now) {
-                return Ok(self.build_route(entry));
+            let avail = self.breaker.check_availability_mut(&entry.id, self.now);
+            match avail {
+                Availability::Available
+                | Availability::AvailableWithWeight(_)
+                | Availability::ProbeAllowed { .. } => {
+                    if matches!(avail, Availability::ProbeAllowed { .. }) {
+                        self.breaker.record_probe_sent(&entry.id, self.now);
+                    }
+                    return Ok(self.build_route(entry));
+                }
+                Availability::Unavailable => continue,
             }
         }
 
