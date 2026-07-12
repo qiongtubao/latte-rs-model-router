@@ -16,6 +16,7 @@ async fn main() -> Result<()> {
         context_window: 65536,
         max_tokens: 8192,
         supports_thinking: false,
+        supports_vision: false,
         cost_per_million_input: 0.0,
         cost_per_million_output: 0.0,
     };
@@ -29,10 +30,12 @@ async fn main() -> Result<()> {
 
     println!(">>> 流式输出开始...\n");
 
-    let mut stream = client.chat_stream(
-        &[Message { role: Role::User, content: "用 Rust 实现斐波那契数列，逐行讲解".into() }],
-        &params,
-    ).await?;
+    let mut stream = client
+        .chat_stream(
+            &[Message::user("用 Rust 实现斐波那契数列，逐行讲解")],
+            &params,
+        )
+        .await?;
 
     let mut full_content = String::new();
     while let Some(event) = stream.recv().await {

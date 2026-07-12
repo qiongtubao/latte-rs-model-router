@@ -121,7 +121,7 @@ impl AiClient {
             .ok_or_else(|| AiError::Other("No choices in response".into()))?;
 
         Ok(Completion {
-            content: choice.message.content.unwrap_or_default(),
+            content: merge_openai_text(choice.message.content),
             stop_reason: choice.finish_reason.unwrap_or_default(),
             usage: TokenUsage {
                 input_tokens: data.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
@@ -180,9 +180,10 @@ impl AiClient {
                     Ok(r) if r.status().is_success() => {
                         match r.json::<OpenAiChatResponse>().await {
                             Ok(data) => {
-                                let content = data.choices.into_iter().next()
-                                    .map(|c| c.message.content.unwrap_or_default())
-                                    .unwrap_or_default();
+                                let content = merge_openai_text(
+                                    data.choices.into_iter().next()
+                                        .and_then(|c| c.message.content)
+                                );
                                 let usage = data.usage.map(|u| TokenUsage {
                                     input_tokens: u.prompt_tokens,
                                     output_tokens: u.completion_tokens,
@@ -230,9 +231,9 @@ impl AiClient {
                         {
                             if r.status().is_success() {
                                 if let Ok(data) = r.json::<OpenAiChatResponse>().await {
-                                    let content = data.choices.into_iter().next()
-                                        .map(|c| c.message.content.unwrap_or_default())
-                                        .unwrap_or_default();
+                                    let content = merge_openai_text(
+                                        data.choices.into_iter().next().and_then(|c| c.message.content)
+                                    );
                                     let u = data.usage.map(|u| TokenUsage {
                                         input_tokens: u.prompt_tokens,
                                         output_tokens: u.completion_tokens,
@@ -332,12 +333,7 @@ impl AiClient {
 
         let data: AnthropicResponse = resp.json().await?;
 
-        let mut content = String::new();
-        for block in &data.content {
-            if let Some(text) = &block.text {
-                content.push_str(text);
-            }
-        }
+        let content = merge_anthropic_text(&data.content);
 
         Ok(Completion {
             content,
@@ -453,7 +449,7 @@ impl AiClient {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                 }.into(),
-                content: m.content.clone(),
+                content: m.content.iter().map(to_openai_content_part).collect(),
             }).collect(),
             temperature: params.temperature,
             top_p: params.top_p,
@@ -489,7 +485,7 @@ impl AiClient {
                     Role::User => "user",
                     Role::Assistant => "assistant",
                 }.into(),
-                content: m.content.clone(),
+                content: m.content.iter().map(to_anthropic_content_block).collect(),
             }).collect(),
             max_tokens,
             temperature: params.temperature,
@@ -501,10 +497,37 @@ impl AiClient {
     }
 }
 
+
+/// Concatenate OpenAI response content parts into a single text string.
+/// Image / tool / refusal parts contribute no text but don't error.
+fn merge_openai_text(parts: Option<Vec<OpenAiResponseContentPart>>) -> String {
+    let mut out = String::new();
+    if let Some(parts) = parts {
+        for p in parts {
+            if let OpenAiResponseContentPart::Text { text } = p {
+                out.push_str(&text);
+            }
+        }
+    }
+    out
+}
+
+/// Concatenate Anthropic response content blocks into a single text string.
+/// Image / tool_use blocks contribute no text but don't error.
+fn merge_anthropic_text(blocks: &[AnthropicContentBlock]) -> String {
+    let mut out = String::new();
+    for b in blocks {
+        if let AnthropicContentBlock::Text { text } = b {
+            out.push_str(text);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ApiType, Message, Role};
+    use crate::models::{ApiType, Message};
 
     fn model_with_key(api: ApiType, key: &str) -> Model {
         Model {
@@ -517,6 +540,7 @@ mod tests {
             context_window: 1024,
             max_tokens: 256,
             supports_thinking: false,
+            supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
         }
@@ -525,7 +549,7 @@ mod tests {
     #[tokio::test]
     async fn chat_openai_blank_api_key_fails_fast() {
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "")).unwrap();
-        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let msg = vec![Message::user("hi")];
         let params = GenerateParams::default();
         let err = client.chat(&msg, &params).await.unwrap_err();
         match err {
@@ -539,7 +563,7 @@ mod tests {
         // Regression: previously the request fired with an empty `x-api-key`
         // header and the vendor returned "x-api-key header is required".
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "")).unwrap();
-        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let msg = vec![Message::user("hi")];
         let params = GenerateParams::default();
         let err = client.chat(&msg, &params).await.unwrap_err();
         match err {
@@ -551,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn chat_whitespace_only_api_key_fails_fast() {
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "   ")).unwrap();
-        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let msg = vec![Message::user("hi")];
         let params = GenerateParams::default();
         let err = client.chat(&msg, &params).await.unwrap_err();
         assert!(matches!(err, AiError::Config(_)));
@@ -560,7 +584,7 @@ mod tests {
     #[tokio::test]
     async fn chat_stream_blank_api_key_fails_fast() {
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "")).unwrap();
-        let msg = vec![Message { role: Role::User, content: "hi".into() }];
+        let msg = vec![Message::user("hi")];
         let params = GenerateParams::default();
         let err = client.chat_stream(&msg, &params).await.unwrap_err();
         assert!(matches!(err, AiError::Config(_)));

@@ -21,7 +21,7 @@ proxy_default_model = "proxy-default"
 
 # 静默挑选的候选池（顺序 = 权重从大到小）
 pool = [
-    "glm-5.2",
     "MiniMax-M3",
+    "glm-5.2",
     "deepseek-v4-flash",
 ]
