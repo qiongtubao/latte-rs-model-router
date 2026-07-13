@@ -6,6 +6,7 @@
 //! [`latte_router`]; this crate provides the axum HTTP shell.
 
 pub mod cli;
+pub mod image_detect;
 pub mod server;
 
 pub use cli::Args;

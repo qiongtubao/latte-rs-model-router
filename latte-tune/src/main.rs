@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
-use latte_ai::models::{ApiType, Message, Model, Role, StreamEvent, TokenUsage};
+use latte_ai::models::{ApiType, Message, Model, StreamEvent, TokenUsage};
 use latte_ai::params::GenerateParams;
 use latte_ai::AiClient;
 use latte_router::{ModelCatalog, ModelEntry};
@@ -193,6 +193,7 @@ fn entry_to_model(entry: &ModelEntry) -> Model {
         context_window: entry.context_window,
         max_tokens: entry.max_tokens,
         supports_thinking: entry.api == ApiType::AnthropicMessages,
+        supports_vision: entry.supports_vision,
         cost_per_million_input: 0.0,
         cost_per_million_output: 0.0,
     }
@@ -439,7 +440,7 @@ async fn run_chat(
                     }
                 }
             }
-            history.push(Message { role: Role::User, content: input });
+            history.push(Message::user(input));
 
             eprint!("\n{} ", "◀".green().bold());
             io::stderr().flush()?;
@@ -447,10 +448,7 @@ async fn run_chat(
             if no_stream {
                 let completion = client.chat(&history, &params).await?;
                 println!("{}", completion.content);
-                history.push(Message {
-                    role: Role::Assistant,
-                    content: completion.content.clone(),
-                });
+                history.push(Message::assistant(completion.content.clone()));
                 eprintln!("\n  {}", completion.usage);
             } else {
                 let mut stream = client.chat_stream(&history, &params).await?;
@@ -469,7 +467,7 @@ async fn run_chat(
                         StreamEvent::Error(e) => eprintln!("\n  {}", e.to_string().red()),
                     }
                 }
-                history.push(Message { role: Role::Assistant, content: full });
+                history.push(Message::assistant(full));
                 eprintln!("\n  {}", usage);
             }
         }
@@ -492,7 +490,7 @@ async fn run_chat(
 
         let client = AiClient::new(model)?;
         let params = GenerateParams::code_defaults();
-        let messages = vec![Message { role: Role::User, content: prompt_text }];
+        let messages = vec![Message::user(prompt_text)];
 
         if no_stream {
             let completion = client.chat(&messages, &params).await?;
@@ -723,6 +721,7 @@ fn build_model(
         context_window,
         max_tokens,
         supports_thinking: api_type == ApiType::AnthropicMessages,
+        supports_vision: false,
         cost_per_million_input: 0.0,
         cost_per_million_output: 0.0,
     }

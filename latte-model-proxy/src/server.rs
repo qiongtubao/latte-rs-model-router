@@ -38,6 +38,8 @@ use tracing::{debug, info, warn};
 use latte_ai::models::ApiType;
 use latte_router::{ModelEntry, Route, Router, RouterError};
 
+use crate::image_detect::body_contains_image;
+
 /// Hard cap on incoming request body. Chat-completion bodies are typically
 /// under 100 KB; 10 MB leaves headroom for large message arrays while
 /// preventing OOM from a malicious client.
@@ -456,10 +458,52 @@ async fn forward_passthrough(
     let model_is_proxy_default = model == state.proxy_default_model;
     let mut body_to_send = parsed;
 
+    // 当请求走 proxy-default 路径时，按能力裁剪候选池：
+    // * 若 body 含图片 → 仅保留 supports_vision=true 的模型，从优先级高到低选
+    // * 否则 → 走全量 candidate 列表（现有行为）
+    // 显式 `model` 路径（!= proxy_default_model）不受影响，由调用方负责匹配能力。
+    let mut candidates: Vec<String> = Vec::new();
+    let image_filter_applied: bool = model_is_proxy_default && body_contains_image(&body_to_send);
+    if model_is_proxy_default {
+        if image_filter_applied {
+            candidates.reserve(state.pool.len());
+            for id in &state.pool {
+                let supports = state
+                    .router
+                    .catalog()
+                    .get(id)
+                    .map(|e| e.supports_vision)
+                    .unwrap_or(false);
+                if supports {
+                    candidates.push(id.clone());
+                }
+            }
+            if candidates.is_empty() {
+                warn!(
+                    target: "latte_model_proxy",
+                    request_id = %request_id,
+                    "proxy-default image request: pool 中没有任何模型声明 supports_vision=true"
+                );
+                return json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no vision-capable model available in priority pool".into(),
+                );
+            }
+            info!(
+                target: "latte_model_proxy",
+                request_id = %request_id,
+                filtered_pool = ?candidates,
+                "proxy-default image request: 按 supports_vision 过滤候选池"
+            );
+        } else {
+            candidates = state.pool.clone();
+        }
+    }
+
     loop {
         // --- 1. Select route ---
         let route: Route = if model_is_proxy_default {
-            match state.router.select_candidates(&state.pool) {
+            match state.router.select_candidates(&candidates) {
                 Ok(r) => r,
                 Err(RouterError::AllUnavailable { retry_after_secs }) => {
                     warn!(
@@ -599,6 +643,11 @@ async fn forward_passthrough(
 
         let response_status = status.as_u16();
         let duration_ms = start.elapsed().as_millis() as u64;
+        // 无论 stream / 非 stream，都要让 breaker 看到该次响应的状态码，
+        // 否则 429/5xx/4xx 永远不会把模型拉出，"未被拉出的"语义就形同虚设。
+        if !(response_status == 403 && model_is_proxy_default) {
+            state.router.record(&route.model_id, response_status, retry_after_secs);
+        }
         // --- 6. 403 transparent retry (proxy-default only, exclude current) ---
         if response_status == 403 && model_is_proxy_default {
             // record in breaker first (counts consecutive 403s, pulls out
@@ -612,8 +661,9 @@ async fn forward_passthrough(
                 "403 from upstream, trying next pool member"
             );
 
-            // exclude current model from pool and try again
-            let filtered_pool: Vec<String> = state.pool.iter()
+            // 从当前候选池（已可能含 supports_vision 过滤）中排除本次失败的
+            // model，避免 fallback 退回到一个不接图片的 text-only 模型。
+            let filtered_pool: Vec<String> = candidates.iter()
                 .filter(|m| *m != &route.model_id)
                 .cloned()
                 .collect();

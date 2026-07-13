@@ -228,14 +228,8 @@ impl TestPrompt {
     /// Build messages for this test prompt.
     pub fn to_messages(&self) -> Vec<Message> {
         vec![
-            Message {
-                role: Role::System,
-                content: self.system.to_string(),
-            },
-            Message {
-                role: Role::User,
-                content: self.user.to_string(),
-            },
+            Message::text(Role::System, self.system.to_string()),
+            Message::text(Role::User, self.user.to_string()),
         ]
     }
 }

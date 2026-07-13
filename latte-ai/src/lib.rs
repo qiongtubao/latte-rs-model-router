@@ -22,6 +22,7 @@
 //!     context_window: 65536,
 //!     max_tokens: 8192,
 //!     supports_thinking: false,
+//!     supports_vision: false,
 //!     cost_per_million_input: 0.27,
 //!     cost_per_million_output: 1.10,
 //! };
@@ -30,7 +31,7 @@
 //! let params = GenerateParams::code_defaults();
 //!
 //! let completion = client.chat(&[
-//!     Message { role: Role::User, content: "Write a Rust function to sum a Vec".into() },
+//!     Message::user("Write a Rust function to sum a Vec"),
 //! ], &params).await?;
 //!
 //! println!("{}", completion.content);

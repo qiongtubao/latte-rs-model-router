@@ -36,6 +36,7 @@ fn make_entry(id: &str, anchor: DateTime<Utc>, interval: u64, threshold: u32, co
         rate_limit_refresh_anchor: anchor, rate_limit_refresh_interval_secs: interval,
         retry_count_5xx: threshold, cooldown_5xx_secs: cooldown,
         retry_on: vec![403], retry_on_count: 10, retry_on_cooldown_secs: 600,
+        supports_vision: false,
     }
 }
 
@@ -446,6 +447,45 @@ api_key = "sk-xxx"
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+
+#[test]
+fn catalog_toml_supports_vision_field() {
+    // supports_vision 缺省 = false；显式 true 时反序列化并保留。
+    // 这是 proxy-default 路径上按能力过滤候选的依赖。
+    let mut dir = std::env::temp_dir();
+    dir.push(format!("latte_test_vision_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let legacy = dir.join("legacy.toml");
+    std::fs::write(&legacy, r#"
+[[models]]
+id = "no-vision"
+api = "openai-completions"
+provider = "p"
+base_url = "https://example"
+api_key = "sk-xxx"
+"#).unwrap();
+
+    let vision = dir.join("vision.toml");
+    std::fs::write(&vision, r#"
+[[models]]
+id = "yes-vision"
+api = "openai-completions"
+provider = "p"
+base_url = "https://example"
+api_key = "sk-xxx"
+supports_vision = true
+"#).unwrap();
+
+    let mut cat = ModelCatalog::new();
+    cat.load_dir(&dir).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(!cat.get("no-vision").unwrap().supports_vision);
+    assert!(cat.get("yes-vision").unwrap().supports_vision);
+}
+
 #[test]
 fn catalog_expands_env_var_in_api_key() {
     std::env::set_var("LATTE_TEST_KEY", "env-val");
@@ -483,6 +523,7 @@ fn catalog_merge_later_overrides_earlier() {
         rate_limit_refresh_anchor: Utc.timestamp_opt(0, 0).unwrap(), rate_limit_refresh_interval_secs: 60,
         retry_count_5xx: 5, cooldown_5xx_secs: 600,
         retry_on: vec![403], retry_on_count: 10, retry_on_cooldown_secs: 600,
+        supports_vision: false,
     };
     let b = ModelEntry { provider: "p2".to_string(), base_url: "http://b".to_string(), api_key: "k2".to_string(), ..a.clone() };
     let cat1 = ModelCatalog::from_entries(vec![a]);

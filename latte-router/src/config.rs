@@ -47,9 +47,16 @@ pub struct ModelEntry {
 
     #[serde(default = "default_retry_on_count")]
     pub retry_on_count: u32,
-
     #[serde(default = "default_retry_on_cooldown")]
     pub retry_on_cooldown_secs: u64,
+
+    /// Whether the model supports image (vision / multimodal) input.
+    /// Defaults to `false` so existing `models.d/*.toml` files keep loading
+    /// unchanged. The proxy uses this to filter the candidate pool for
+    /// `proxy-default` requests that contain image content, so a vision
+    /// request never gets silently downgraded to a text-only model.
+    #[serde(default)]
+    pub supports_vision: bool,
 }
 
 fn default_context_window() -> u32 {

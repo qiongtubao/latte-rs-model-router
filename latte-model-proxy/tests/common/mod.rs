@@ -25,7 +25,16 @@ pub fn make_entry(id: &str, api: ApiType, base_url: String) -> ModelEntry {
         retry_on: vec![403],
         retry_on_count: 10,
         retry_on_cooldown_secs: 600,
+        supports_vision: false,
     }
+}
+
+/// 构造一个声明 supports_vision=true 的模型条目。
+/// proxy-default 图片请求路由测试专用。
+pub fn make_entry_with_vision(id: &str, api: ApiType, base_url: String) -> ModelEntry {
+    let mut entry = make_entry(id, api, base_url);
+    entry.supports_vision = true;
+    entry
 }
 
 pub fn make_anthropic_entry(id: &str, base_url: String) -> ModelEntry {
@@ -34,6 +43,10 @@ pub fn make_anthropic_entry(id: &str, base_url: String) -> ModelEntry {
 
 pub fn make_openai_entry(id: &str, base_url: String) -> ModelEntry {
     make_entry(id, ApiType::OpenAiCompletions, base_url)
+}
+
+pub fn make_openai_entry_with_vision(id: &str, base_url: String) -> ModelEntry {
+    make_entry_with_vision(id, ApiType::OpenAiCompletions, base_url)
 }
 
 pub fn router_with(entries: Vec<ModelEntry>) -> Arc<Router> {

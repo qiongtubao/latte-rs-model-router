@@ -52,6 +52,7 @@ async fn server_with_one_entry_selects_that_model() {
         retry_on: vec![403],
         retry_on_count: 10,
         retry_on_cooldown_secs: 600,
+        supports_vision: false,
     };
     let server = Server::with_entries(vec![entry], "test".to_string());
 
