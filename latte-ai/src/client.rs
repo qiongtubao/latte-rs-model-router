@@ -9,6 +9,23 @@ use crate::error::{AiError, Result};
 use crate::models::*;
 use crate::params::GenerateParams;
 
+/// `LATTE_AI_DEBUG_HTTP=1` 启用：把 `chat_openai` / `chat_anthropic` 实际
+/// 发的 request body 和失败时的 response 原始字节打到 stderr。
+///
+/// 用途：定位 vendor 集成 bug —— 当 `test` 命令报 "error decoding
+/// response body" 这种**无法**从错误字符串反推的错时，开这个开关能
+/// 直接看到 "AiClient 发了什么" 和 "vendor 回了什么字节序列"。
+///
+/// 设计：默认关（零成本），用 env var 触发（不需要改 config 也不需要
+/// 重启 binary 之外的依赖）。打印走 eprintln，**不**走 tracing：
+/// 普通 `RUST_LOG=info` 用户不会被噪音打到；想用的人显式开。
+fn debug_http_enabled() -> bool {
+    std::env::var("LATTE_AI_DEBUG_HTTP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+
 /// A client for interacting with AI models via OpenAI-compatible or Anthropic APIs.
 #[derive(Clone)]
 pub struct AiClient {
@@ -88,6 +105,16 @@ impl AiClient {
 
         let req = self.build_openai_request(messages, params, false);
         debug!(url, model = %req.model, "OpenAI request");
+
+        // Debug 钩子：发包前打印 body。`LATTE_AI_DEBUG_HTTP=1` 启用。
+        // 排查 vendor 集成 bug 时用 —— `--raw` 看不到 AiClient 实际发的字段。
+        if debug_http_enabled() {
+            if let Ok(body_str) = serde_json::to_string(&req) {
+                eprintln!("[latte_ai debug] POST {} (model={})", url, req.model);
+                eprintln!("[latte_ai debug] body: {}", body_str);
+            }
+        }
+
         let resp = self.http
             .post(&url)
             .header("Authorization", format!("Bearer {}", self.model.api_key))
@@ -116,10 +143,41 @@ impl AiClient {
             });
         }
 
-        let data: OpenAiChatResponse = resp.json().await?;
+        // `resp.bytes().await` 拿走了 resp，所以**先 clone headers**才能在错时打。
+        let headers = resp.headers().clone();
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                if debug_http_enabled() {
+                    eprintln!("[latte_ai debug] body read failed: {e}");
+                    eprintln!("[latte_ai debug] status: {}", status);
+                    eprintln!("[latte_ai debug] content-type: {:?}", headers.get("content-type"));
+                    eprintln!("[latte_ai debug] content-encoding: {:?}", headers.get("content-encoding"));
+                    eprintln!("[latte_ai debug] transfer-encoding: {:?}", headers.get("transfer-encoding"));
+                }
+                return Err(AiError::Http(e));
+            }
+        };
+        if debug_http_enabled() {
+            eprintln!("[latte_ai debug] response status: {}", status);
+            eprintln!("[latte_ai debug] body bytes: {} (first 400 below)", bytes.len());
+            // utf-8 lossy —— vendor body 大概率是合法 JSON，但保底不 panic。
+            let preview = String::from_utf8_lossy(&bytes[..bytes.len().min(400)]);
+            eprintln!("[latte_ai debug] body preview: {}", preview);
+        }
+        let data: OpenAiChatResponse = match serde_json::from_slice(&bytes) {
+            Ok(d) => d,
+            Err(e) => {
+                if debug_http_enabled() {
+                    eprintln!("[latte_ai debug] JSON parse FAILED: {e}");
+                    eprintln!("[latte_ai debug] full body dump:");
+                    eprintln!("{}", String::from_utf8_lossy(&bytes));
+                }
+                return Err(AiError::Serde(e));
+            }
+        };
         let choice = data.choices.into_iter().next()
             .ok_or_else(|| AiError::Other("No choices in response".into()))?;
-
         Ok(Completion {
             content: merge_openai_text(choice.message.content),
             stop_reason: choice.finish_reason.unwrap_or_default(),
@@ -498,14 +556,25 @@ impl AiClient {
 }
 
 
-/// Concatenate OpenAI response content parts into a single text string.
-/// Image / tool / refusal parts contribute no text but don't error.
-fn merge_openai_text(parts: Option<Vec<OpenAiResponseContentPart>>) -> String {
+/// Concatenate OpenAI response content into a single text string.
+/// 同时支持 string 形态（minimax 等）和 array 形态（OpenAI 官方）。
+/// Image / tool / refusal parts 贡献空串但不报错。
+fn merge_openai_text(content: Option<OpenAiResponseContent>) -> String {
     let mut out = String::new();
-    if let Some(parts) = parts {
-        for p in parts {
-            if let OpenAiResponseContentPart::Text { text } = p {
-                out.push_str(&text);
+    if let Some(c) = content {
+        match c {
+            // minimax 路径：直接拿到 string，**原样返回** —— 包括 vendor 的
+            // `<think>...</think>` 块。这块如果调用方想要剥离，可以在上层
+            // 用 `extract_thinking` 之类的工具函数处理；merge 不应该擅自
+            // 改 vendor 的内容。
+            OpenAiResponseContent::Plain(s) => out.push_str(&s),
+            // OpenAI 官方路径：拼所有 text parts。
+            OpenAiResponseContent::Parts(parts) => {
+                for p in parts {
+                    if let OpenAiResponseContentPart::Text { text } = p {
+                        out.push_str(&text);
+                    }
+                }
             }
         }
     }

@@ -140,6 +140,15 @@ impl Message {
         self.joined_text().unwrap_or_default()
     }
 
+    /// Whether this message contains at least one image content part.
+    /// The `Agent::request` method uses this to skip non-vision models
+    /// in the model_chain when `has_image()` is true. Text-only
+    /// messages can still use any model regardless of `supports_vision`.
+    pub fn has_image(&self) -> bool {
+        self.content.iter().any(|p| matches!(p, ContentPart::Image { .. }))
+    }
+
+    /// Returns all text parts joined, or `None` when
     /// Concatenate all `Text` parts into a single string. Returns `None` if
     /// the message has no text at all (image-only).
     pub fn joined_text(&self) -> Option<String> {
@@ -294,12 +303,29 @@ pub(crate) struct OpenAiChoice {
     pub finish_reason: Option<String>,
 }
 
+/// **OpenAI 协议里 `message.content` 同时有两种合法形态**：
+/// - `String` — 简单文本响应（minimax / DeepSeek / 大多数第三方 vendor 默认走这个）
+/// - `Vec<OpenAiResponseContentPart>` — 标准 OpenAI 官方 / 多模态响应
+///
+/// 之前写死 `Option<Vec<...>>` 是 bug：minimax 等 vendor 总是返回 string，
+/// 反序列化直接 `Serde` 错。`#[serde(untagged)]` 让两种都能 match 上。
+/// `merge_openai_text` 同时支持两种形态并把 text parts 拼起来。
+#[derive(Deserialize, Clone)]
+#[serde(untagged)]
+pub(crate) enum OpenAiResponseContent {
+    /// minimax / DeepSeek / 多数国产 vendor 默认形态。
+    Plain(String),
+    /// OpenAI 官方 + vision 场景。
+    Parts(Vec<OpenAiResponseContentPart>),
+}
+
 #[derive(Deserialize)]
 pub(crate) struct OpenAiResponseMessage {
     /// OpenAI returns `null` for assistant tool-call turns; `Some([])` is
     /// technically possible but not in practice. Treated as "no text".
+    /// `Some("")` 同样视为 "no text"。
     #[serde(default)]
-    pub content: Option<Vec<OpenAiResponseContentPart>>,
+    pub content: Option<OpenAiResponseContent>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -561,13 +587,48 @@ mod tests {
 
     #[test]
     fn openai_response_message_with_text_part_deserializes() {
+        // OpenAI 官方形态：`content` 是 parts 数组。
         let j = serde_json::json!({"content": [{"type": "text", "text": "hi"}]});
         let m: OpenAiResponseMessage = serde_json::from_value(j).unwrap();
-        let parts = m.content.unwrap();
-        assert_eq!(parts.len(), 1);
-        match &parts[0] {
-            OpenAiResponseContentPart::Text { text } => assert_eq!(text, "hi"),
-            OpenAiResponseContentPart::Other => panic!("expected text part"),
+        let content = m.content.unwrap();
+        match content {
+            OpenAiResponseContent::Parts(parts) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    OpenAiResponseContentPart::Text { text } => assert_eq!(text, "hi"),
+                    OpenAiResponseContentPart::Other => panic!("expected text part"),
+                }
+            }
+            OpenAiResponseContent::Plain(_) => panic!("expected Parts variant"),
+        }
+    }
+
+    /// **直接复现 minimax 形态**：`content` 是 string 而非 array。
+    /// 这是 `error decoding response body` panic 的根因 —— 旧版 `OpenAiResponseMessage`
+    /// 写死 `Vec<...>`，minimax 返 string 就 Serde 错。
+    /// 这个测试是回归保险：以后谁改回 `Vec<...>` 写法就会立刻挂掉。
+    #[test]
+    fn openai_response_message_with_plain_string_content_deserializes() {
+        // 模拟 minimax 在 `content: [{"type":"text","text":"..."}]` 请求下
+        // 实际返回的 body —— content 是 string，带 `<think>` 块。
+        let body = r#"{
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "<think>The user asks...</think>\n\n我是 MiniMax-M3, 由 MiniMax 开发。",
+                    "role": "assistant"
+                }
+            }],
+            "usage": {"prompt_tokens": 180, "completion_tokens": 75}
+        }"#;
+        let resp: OpenAiChatResponse = serde_json::from_str(body).unwrap();
+        let choice = resp.choices.into_iter().next().unwrap();
+        match choice.message.content.unwrap() {
+            OpenAiResponseContent::Plain(s) => {
+                assert!(s.contains("<think>"));
+                assert!(s.contains("MiniMax-M3"));
+            }
+            OpenAiResponseContent::Parts(_) => panic!("minimax should return Plain variant"),
         }
     }
 }
