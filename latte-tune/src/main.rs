@@ -9,7 +9,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::*;
-use latte_ai::models::{ApiType, Message, Model, StreamEvent, TokenUsage};
+use latte_ai::models::{ApiType, ContentPart, Message, Model, StreamEvent, TokenUsage};
 use latte_ai::params::GenerateParams;
 use latte_ai::AiClient;
 use latte_router::{ModelCatalog, ModelEntry};
@@ -448,7 +448,7 @@ async fn run_chat(
             if no_stream {
                 let completion = client.chat(&history, &params).await?;
                 println!("{}", completion.content);
-                history.push(Message::assistant(completion.content.clone()));
+                history.push(Message::assistant(completion.as_text()));
                 eprintln!("\n  {}", completion.usage);
             } else {
                 let mut stream = client.chat_stream(&history, &params).await?;
@@ -457,8 +457,12 @@ async fn run_chat(
                 while let Some(event) = stream.recv().await {
                     match event {
                         StreamEvent::Delta { content, usage: u } => {
-                            print!("{}", content);
-                            full.push_str(&content);
+                            for part in &content {
+                                if let ContentPart::Text { text } = part {
+                                    print!("{}", text);
+                                    full.push_str(text);
+                                }
+                            }
                             if let Some(u) = u {
                                 usage = u;
                             }
@@ -502,7 +506,11 @@ async fn run_chat(
             while let Some(event) = stream.recv().await {
                 match event {
                     StreamEvent::Delta { content, usage: u } => {
-                        print!("{}", content);
+                        for part in &content {
+                            if let ContentPart::Text { text } = part {
+                                print!("{}", text);
+                            }
+                        }
                         if let Some(u) = u {
                             usage = u;
                         }

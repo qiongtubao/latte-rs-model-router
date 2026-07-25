@@ -53,7 +53,7 @@ pub mod prelude {
     pub use crate::client::AiClient;
     pub use crate::error::Result;
     pub use crate::models::{
-        ApiType, Completion, Message, Model, Role, StreamEvent, TokenUsage,
+        ApiType, Completion, Message, Model, Role, StreamEvent, TokenUsage, Tool, ToolCall,
     };
     pub use crate::params::{GenerateParams, ThinkingBudget};
 }

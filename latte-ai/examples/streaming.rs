@@ -2,8 +2,8 @@
 //!
 //! 运行:
 //!   DEEPSEEK_API_KEY="sk-..." cargo run --example streaming
-
 use latte_ai::prelude::*;
+use latte_ai::models::ContentPart;
 #[tokio::main]
 async fn main() -> Result<()> {
     let model = Model {
@@ -41,8 +41,12 @@ async fn main() -> Result<()> {
     while let Some(event) = stream.recv().await {
         match event {
             StreamEvent::Delta { content, .. } => {
-                print!("{}", content);
-                full_content.push_str(&content);
+                for p in &content {
+                    if let ContentPart::Text { text } = p {
+                        print!("{}", text);
+                        full_content.push_str(text);
+                    }
+                }
             }
             StreamEvent::Done { usage, .. } => {
                 println!("\n\n<<< 完成");

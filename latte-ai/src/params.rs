@@ -43,6 +43,15 @@ pub struct GenerateParams {
 
     /// Seed for reproducible generation (if supported by provider).
     pub seed: Option<u64>,
+
+    /// 工具列表。空表示不传 `tools`，模型就当普通聊天处理。
+    #[serde(default)]
+    pub tools: Vec<crate::models::Tool>,
+
+    /// 工具调用策略。`ToolChoice::Auto`（默认）让模型自己决定。
+    /// OpenAI 协议下 `None` 表示显式禁调；Anthropic 协议下不支持 None。
+    #[serde(default)]
+    pub tool_choice: crate::models::ToolChoice,
 }
 
 /// Thinking/reasoning budget levels.
@@ -84,6 +93,8 @@ impl GenerateParams {
             stop_sequences: vec![],
             thinking_budget: None,
             seed: None,
+            tools: vec![],
+            tool_choice: crate::models::ToolChoice::Auto,
         }
     }
 
@@ -101,6 +112,8 @@ impl GenerateParams {
             stop_sequences: vec![],
             thinking_budget: None,
             seed: None,
+            tools: vec![],
+            tool_choice: crate::models::ToolChoice::Auto,
         }
     }
 
@@ -118,6 +131,8 @@ impl GenerateParams {
             stop_sequences: vec![],
             thinking_budget: Some(ThinkingBudget::Medium),
             seed: None,
+            tools: vec![],
+            tool_choice: crate::models::ToolChoice::Auto,
         }
     }
 
@@ -173,6 +188,8 @@ impl Default for GenerateParams {
             stop_sequences: vec![],
             thinking_budget: None,
             seed: None,
+            tools: vec![],
+            tool_choice: crate::models::ToolChoice::Auto,
         }
     }
 }
