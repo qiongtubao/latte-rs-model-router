@@ -53,6 +53,13 @@ pub struct Model {
 
     /// Cost per million output tokens (USD).
     pub cost_per_million_output: f64,
+
+    /// Per-request timeout in seconds. `None` → 300s default (hardcoded
+    /// in `AiClient::new`). Lets heavy long-context roles (architect
+    /// building a large structure) raise their ceiling instead of
+    /// tripping the HTTP client timeout mid-request.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// One piece of a message's content — either plain text or an inline image.

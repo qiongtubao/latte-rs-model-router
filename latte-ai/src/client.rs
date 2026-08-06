@@ -43,7 +43,10 @@ impl AiClient {
     /// Create a new client for the given model.
     pub fn new(model: Model) -> Result<Self> {
         let http = HttpClient::builder()
-            .timeout(Duration::from_secs(300))
+            // 默认 300s（历史兜底）；模型声明了 timeout_secs 则用它
+            // 覆盖 —— 长上下文/重产出角色（如 workflow 的 architect
+            // 搭结构）可调高避免单次请求撞 HTTP 超时。
+            .timeout(Duration::from_secs(model.timeout_secs.unwrap_or(300)))
             .build()?;
         Ok(Self { http, model })
     }
