@@ -25,6 +25,7 @@
 //!     supports_vision: false,
 //!     cost_per_million_input: 0.27,
 //!     cost_per_million_output: 1.10,
+//!     timeout_secs: None,
 //! };
 //!
 //! let client = AiClient::new(model)?;

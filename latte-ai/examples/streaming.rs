@@ -19,6 +19,7 @@ async fn main() -> Result<()> {
         supports_vision: false,
         cost_per_million_input: 0.0,
         cost_per_million_output: 0.0,
+        timeout_secs: None,
     };
 
     let client = AiClient::new(model)?;
@@ -51,6 +52,9 @@ async fn main() -> Result<()> {
             StreamEvent::Done { usage, .. } => {
                 println!("\n\n<<< 完成");
                 println!("用量: {}", usage);
+            }
+            StreamEvent::HttpError { status, message } => {
+                eprintln!("\n<<< HTTP 错误 {status}: {message}");
             }
             StreamEvent::Error(e) => {
                 eprintln!("\n<<< 错误: {}", e);
