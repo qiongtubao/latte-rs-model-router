@@ -598,9 +598,28 @@ impl AiClient {
                             .collect::<Vec<_>>()
                             .join("\n"),
                     ),
-                    _ => OpenAiMessageContent::Parts(
-                        m.content.iter().map(to_openai_content_part).collect(),
-                    ),
+                    _ => {
+                        // 过滤空 text part：kimi k3 等 vendor 对
+                        // `{"type":"text","text":""}` 直接 400
+                        // （"text content is empty"），而 `content: []`
+                        // 是合法的（assistant 只发 tool_calls 不产文本
+                        // 时本来就是空）。坏消息一旦进 history 会让之后
+                        // 每个请求都 400，必须在 wire 构造处拦掉。
+                        let parts: Vec<OpenAiContentPart> = m.content.iter()
+                            .filter(|p| !matches!(p, ContentPart::Text { text } if text.is_empty()))
+                            .map(to_openai_content_part)
+                            .collect();
+                        if parts.is_empty() && m.tool_calls.is_none() {
+                            // 完全没有内容且不是工具调用回合：空 user/
+                            // assistant 消息同样会被 vendor 拒绝
+                            // （"must not be empty"），给一个占位空格。
+                            OpenAiMessageContent::Parts(vec![OpenAiContentPart::Text {
+                                text: " ".into(),
+                            }])
+                        } else {
+                            OpenAiMessageContent::Parts(parts)
+                        }
+                    }
                 };
                 OpenAiMessage {
                     role: match m.role {
@@ -691,7 +710,20 @@ impl AiClient {
                             is_error: None,
                         }]
                     }
-                    _ => m.content.iter().map(to_anthropic_content_block).collect(),
+                    _ => {
+                        // 与 OpenAI 路径一致：滤掉空 text block（Anthropic
+                        // 对空 text block 同样 400），全空且无内容时给
+                        // 占位空格兜底。
+                        let blocks: Vec<AnthropicContentBlock> = m.content.iter()
+                            .filter(|p| !matches!(p, ContentPart::Text { text } if text.is_empty()))
+                            .map(to_anthropic_content_block)
+                            .collect();
+                        if blocks.is_empty() {
+                            vec![AnthropicContentBlock::Text { text: " ".into() }]
+                        } else {
+                            blocks
+                        }
+                    }
                 };
                 AnthropicMessage { role, content }
             }).collect(),
@@ -935,6 +967,49 @@ mod tests {
         assert_eq!(j["messages"][0]["tool_calls"][0]["function"]["name"], "get_weather");
         // arguments 是 JSON 字符串（OpenAI 协议规定）
         assert_eq!(j["messages"][0]["tool_calls"][0]["function"]["arguments"], r#"{"city":"上海"}"#);
+    }
+
+    #[test]
+    fn openai_request_filters_empty_text_parts() {
+        // 回归：kimi k3 等 vendor 对 `{"type":"text","text":""}` 直接
+        // 400（"text content is empty"）。assistant 只发 tool_calls
+        // 不产文本时 content 是空串——空 text part 必须在 wire 构造处
+        // 滤掉，否则坏消息进 history 后每个后续请求都 400。
+        let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
+        let params = GenerateParams::default();
+        let assistant = Message::assistant_with_tool_calls(
+            "",
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+                arguments_raw: Some(r#"{"command":"ls"}"#.into()),
+                arguments_parse_error: None,
+            }],
+        );
+        let req = client.build_openai_request(&[assistant], &params, false);
+        let j = serde_json::to_value(&req).unwrap();
+        // 空 text part 被滤掉：content 是空数组，不是 [{"type":"text","text":""}]
+        assert_eq!(j["messages"][0]["content"], serde_json::json!([]));
+        // tool_calls 不受影响
+        assert_eq!(j["messages"][0]["tool_calls"][0]["id"], "call_1");
+
+        // 无 tool_calls 的全空消息：vendor 也拒绝 content: []
+        // （"must not be empty"），给占位空格兜底。
+        let req = client.build_openai_request(&[Message::user("")], &params, false);
+        let j = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            j["messages"][0]["content"],
+            serde_json::json!([{"type": "text", "text": " "}])
+        );
+
+        // 非空 text part 原样保留（过滤不误伤）。
+        let req = client.build_openai_request(&[Message::user("hi")], &params, false);
+        let j = serde_json::to_value(&req).unwrap();
+        assert_eq!(
+            j["messages"][0]["content"],
+            serde_json::json!([{"type": "text", "text": "hi"}])
+        );
     }
 
     #[test]
