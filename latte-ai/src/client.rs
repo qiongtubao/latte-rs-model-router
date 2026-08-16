@@ -25,6 +25,45 @@ fn debug_http_enabled() -> bool {
         .unwrap_or(false)
 }
 
+// ── 流式超时常量 ──────────────────────────────────────────────────
+//
+// 双层超时模型（替代旧的总死线 `.timeout(300s)`）：
+//   1. 首 token 超时（TTFB）：模型处理 prompt + 吐第一个 token 的窗口。
+//      reasoning 模型可能思考很久，默认 100s。
+//   2. idle 超时：两个 SSE chunk 之间的最大间隔。只要 token 在持续
+//      流动就不会触发，总生成时间无上限。默认 120s。
+//
+// 环境变量覆盖（设为 0 关闭 watchdog，仅调试用）：
+//   LATTE_AI_FIRST_EVENT_TIMEOUT_SECS=100
+//   LATTE_AI_IDLE_TIMEOUT_SECS=120
+
+/// 首 token 超时（秒）。模型声明了 `timeout_secs` 时取 max，让重产出
+/// 角色有更宽的首-token 窗口。
+fn first_event_timeout_secs(model_timeout: Option<u64>) -> u64 {
+    let base = env_timeout_secs("LATTE_AI_FIRST_EVENT_TIMEOUT_SECS", 100);
+    match model_timeout {
+        Some(t) if t > 0 => base.max(t),
+        _ => base,
+    }
+}
+
+/// idle 超时（秒）：两个 SSE chunk 之间的最大间隔。
+fn idle_timeout_secs(model_timeout: Option<u64>) -> u64 {
+    let base = env_timeout_secs("LATTE_AI_IDLE_TIMEOUT_SECS", 120);
+    match model_timeout {
+        Some(t) if t > 0 => base.max(t),
+        _ => base,
+    }
+}
+
+/// 从环境变量读取超时秒数；未设置时用 `default_secs`；设为 0 返回 0（关闭）。
+fn env_timeout_secs(var: &str, default_secs: u64) -> u64 {
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default_secs)
+}
+
 
 /// A client for interacting with AI models via OpenAI-compatible or Anthropic APIs.
 #[derive(Clone)]
@@ -40,22 +79,62 @@ impl std::fmt::Debug for AiClient {
 }
 
 impl AiClient {
-    /// Create a new client for the given model.
+    /// 创建 AI 模型客户端。
+    ///
+    /// 超时策略：只设 TCP 连接超时（30s），**不设总请求死线**。
+    /// 实际的响应超时由 [`AiClient::chat`] 内部的流式 idle watchdog
+    /// 管理（首-token 100s + chunk 间隔 120s），支持任意长生成。
+    /// `model.timeout_secs` 仍然生效：作为 idle watchdog 的下限
+    /// （取 max），让重产出角色有更宽的窗口。
     pub fn new(model: Model) -> Result<Self> {
         let http = HttpClient::builder()
-            .timeout(Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self { http, model })
     }
 
     // ── public API ─────────────────────────────────────────────
 
-    /// Send a non-streaming chat completion request.
+    /// 发送聊天完成请求，返回完整 [`Completion`]。
+    ///
+    /// 内部走**流式传输**（`stream: true`）+ idle watchdog 消费到完整
+    /// 响应，对调用方完全透明（返回类型不变）。超时模型：
+    ///   - 首 token 超时（TTFB）：默认 100s，可被 `model.timeout_secs`
+    ///     或 `LATTE_AI_FIRST_EVENT_TIMEOUT_SECS` 覆盖。
+    ///   - idle 超时：两个 chunk 间默认 120s，可被
+    ///     `LATTE_AI_IDLE_TIMEOUT_SECS` 覆盖。
+    ///   - 总生成时间无上限：只要 token 在流，不会因总时间超时。
     pub async fn chat(&self, messages: &[Message], params: &GenerateParams) -> Result<Completion> {
         self.check_api_key()?;
-        match self.model.api {
-            ApiType::OpenAiCompletions => self.chat_openai(messages, params).await,
-            ApiType::AnthropicMessages => self.chat_anthropic(messages, params).await,
+        let mut rx = self.chat_stream(messages, params).await?;
+        let ttfb = first_event_timeout_secs(self.model.timeout_secs);
+        let idle = idle_timeout_secs(self.model.timeout_secs);
+        // 第一层：TTFB 超时 -- 等首个 SSE 事件到达。
+        let first = if ttfb > 0 {
+            tokio::time::timeout(Duration::from_secs(ttfb), rx.recv())
+                .await
+                .map_err(|_| AiError::Stream(format!("等待首个事件超时（{ttfb}s 无响应）")))?
+        } else {
+            rx.recv().await
+        };
+        let first = first.ok_or_else(|| AiError::Stream("stream 在发送任何事件前关闭".into()))?;
+        // 首事件可能直接是 Done（短响应）或 Error（连接级失败）。
+        if let Some(c) = Self::completion_from_event(first) {
+            return c;
+        }
+        // 第二层：idle 超时 -- 逐 chunk 消费到 Done。
+        loop {
+            let next = if idle > 0 {
+                tokio::time::timeout(Duration::from_secs(idle), rx.recv())
+                    .await
+                    .map_err(|_| AiError::Stream(format!("流式响应空闲超时（{idle}s 无新数据）")))?
+            } else {
+                rx.recv().await
+            };
+            let next = next.ok_or_else(|| AiError::Stream("stream 在 Done 之前关闭".into()))?;
+            if let Some(c) = Self::completion_from_event(next) {
+                return c;
+            }
         }
     }
 
@@ -90,6 +169,37 @@ impl AiClient {
         }
         Ok(())
     }
+
+/// 将 [`StreamEvent`] 转换为 [`Completion`]。
+///
+/// - `Done` -> `Some(Ok(Completion))`：流结束，返回完整响应。
+/// - `Error` -> `Some(Err)`：流内错误，直接返回。
+/// - `Delta` -> `None`：增量数据，调用方继续消费。
+///
+/// `chat()` 逐事件调用此函数；返回 `None` 时继续 `rx.recv()`。
+fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
+    match event {
+        StreamEvent::Done { content, tool_calls, usage, stop_reason } => {
+            let text = content.iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            Some(Ok(Completion {
+                content: text,
+                content_parts: content,
+                tool_calls,
+                stop_reason,
+                usage,
+            }))
+        }
+        StreamEvent::HttpError { status, message } => Some(Err(AiError::Api { status, message })),
+        StreamEvent::Error(e) => Some(Err(AiError::Stream(e))),
+        StreamEvent::Delta { .. } => None,
+    }
+}
 
     // ── OpenAI chat completions (non-streaming) ─────────────────────────
 
@@ -232,6 +342,13 @@ impl AiClient {
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
+                // Auth 错误（401/403）不需要非流式 fallback -- 换 stream 模式
+                // 不会修复鉴权问题，只会多浪费一个请求。直接返回 HttpError。
+                if matches!(status.as_u16(), 401 | 403) {
+                    tx.send(StreamEvent::HttpError { status: status.as_u16(), message: body }).await.ok();
+                    return;
+                }
+                // 其他错误（如 500 / 不支持流式）：尝试非流式 fallback
                 // Fall back to non-streaming
                 let mut ns = req.clone();
                 ns.stream = false;
@@ -255,7 +372,7 @@ impl AiClient {
                                     thinking_tokens: 0,
                                 }).unwrap_or_default();
                                 tx.send(StreamEvent::Delta { content: content.clone(), usage: Some(usage.clone()) }).await.ok();
-                                tx.send(StreamEvent::Done { content, tool_calls: vec![], usage }).await.ok();
+                                tx.send(StreamEvent::Done { content, tool_calls: vec![], usage, stop_reason: String::new() }).await.ok();
                             }
                             Err(e) => {
                                 tx.send(StreamEvent::Error(format!("Parse error: {e}"))).await.ok();
@@ -264,10 +381,10 @@ impl AiClient {
                     }
                     Ok(r) => {
                         let b = r.text().await.unwrap_or_default();
-                        tx.send(StreamEvent::Error(format!("Stream {status} — {body}; non-stream also failed: {b}"))).await.ok();
+                        tx.send(StreamEvent::HttpError { status: status.as_u16(), message: format!("{body}; non-stream also failed: {b}") }).await.ok();
                     }
                     Err(e) => {
-                        tx.send(StreamEvent::Error(format!("Stream {status} — {body}; fallback failed: {e}"))).await.ok();
+                        tx.send(StreamEvent::HttpError { status: status.as_u16(), message: format!("{body}; fallback failed: {e}") }).await.ok();
                     }
                 }
                 return;
@@ -280,6 +397,7 @@ impl AiClient {
             let mut full_text = String::new();
             let mut usage = TokenUsage::default();
             let mut tool_call_acc: Vec<ToolCallAccum> = Vec::new();
+            let mut finish_reason = String::new();
 
             while let Some(chunk) = byte_stream.next().await {
                 let bytes = match chunk {
@@ -306,7 +424,7 @@ impl AiClient {
                                         thinking_tokens: 0,
                                     }).unwrap_or_default();
                                     tx.send(StreamEvent::Delta { content: content.clone(), usage: Some(u.clone()) }).await.ok();
-                                    tx.send(StreamEvent::Done { content, tool_calls: vec![], usage: u }).await.ok();
+                                    tx.send(StreamEvent::Done { content, tool_calls: vec![], usage: u, stop_reason: String::new() }).await.ok();
                                     return;
                                 }
                             }
@@ -330,6 +448,7 @@ impl AiClient {
                                     content: vec![ContentPart::Text { text: full_text.clone() }],
                                     tool_calls: final_calls,
                                     usage: usage.clone(),
+                                    stop_reason: finish_reason.clone(),
                                 }).await.ok();
                                 return;
                             }
@@ -359,7 +478,8 @@ impl AiClient {
                                                 entry.arguments.push_str(args);
                                             }
                                         }
-                                        if choice.finish_reason.is_some() {
+                                        if let Some(fr) = choice.finish_reason.as_ref() {
+                                            finish_reason = fr.clone();
                                             if let Some(u) = &chunk.usage {
                                                 usage = TokenUsage {
                                                     input_tokens: u.prompt_tokens,
@@ -379,12 +499,40 @@ impl AiClient {
                 }
             }
 
-            // Stream ended without [DONE] — send what we have
+            // Fallback：如果没有解析到任何 SSE 事件（full_text 为空、
+            // tool_call_acc 为空、buf 有剩余数据），尝试把 buf 当作
+            // 非流式 JSON 响应解析。场景：代理/网关不支持 SSE，收到
+            // stream:true 请求但返回普通 JSON 响应。
+            if full_text.is_empty() && tool_call_acc.is_empty() && !buf.is_empty() {
+                if let Ok(data) = serde_json::from_str::<OpenAiChatResponse>(&buf) {
+                    let u = TokenUsage {
+                        input_tokens: data.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
+                        output_tokens: data.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
+                        thinking_tokens: 0,
+                    };
+                    if let Some(choice) = data.choices.into_iter().next() {
+                        let (parts, tool_calls) = extract_openai_response(
+                            choice.message.content,
+                            choice.message.tool_calls,
+                        );
+                        tx.send(StreamEvent::Delta { content: parts.clone(), usage: Some(u.clone()) }).await.ok();
+                        tx.send(StreamEvent::Done {
+                            content: parts,
+                            tool_calls,
+                            usage: u,
+                            stop_reason: choice.finish_reason.unwrap_or_default(),
+                        }).await.ok();
+                        return;
+                    }
+                }
+            }
+            // Stream ended without [DONE] - send what we have
             let final_calls = build_stream_tool_calls(&tool_call_acc);
             tx.send(StreamEvent::Done {
                 content: vec![ContentPart::Text { text: full_text }],
                 tool_calls: final_calls,
                 usage,
+                stop_reason: finish_reason,
             }).await.ok();
         });
 
@@ -478,6 +626,7 @@ impl AiClient {
 
             let mut full_text = String::new();
             let mut usage = TokenUsage::default();
+            let mut stop_reason = String::new();
             let mut tool_use_accum: std::collections::HashMap<u32, (String, String, String)> =
                 std::collections::HashMap::new();
 
@@ -517,6 +666,12 @@ impl AiClient {
                                         }
                                     }
                                     "message_delta" => {
+                                        // Anthropic 的 stop_reason 在 delta.stop_reason 里
+                                        if let Some(delta) = &evt.delta {
+                                            if let Some(sr) = &delta.stop_reason {
+                                                stop_reason = sr.clone();
+                                            }
+                                        }
                                         if let Some(u) = &evt.usage {
                                             usage = TokenUsage {
                                                 input_tokens: u.input_tokens,
@@ -570,6 +725,7 @@ impl AiClient {
                 },
                 tool_calls: final_calls,
                 usage,
+                stop_reason,
             }).await.ok();
         });
 
@@ -660,6 +816,7 @@ impl AiClient {
                     name: t.name.clone(),
                     description: t.description.clone(),
                     parameters: t.parameters.clone(),
+                    strict: t.strict,
                 },
             }).collect(),
             tool_choice: if params.tools.is_empty() && params.tool_choice == ToolChoice::Auto {
@@ -837,6 +994,7 @@ mod tests {
             supports_vision: false,
             cost_per_million_input: 0.0,
             cost_per_million_output: 0.0,
+            timeout_secs: None,
         }
     }
 
@@ -897,11 +1055,7 @@ mod tests {
         // 出现在 wire 请求中。
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "get_weather".into(),
-            description: Some("查天气".into()),
-            parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}}}),
-        });
+        params.tools.push(Tool { name: "get_weather".into(), description: Some("查天气".into()), parameters: serde_json::json!({"type":"object","properties":{"city":{"type":"string"}}}), strict: None });
         let req = client.build_openai_request(&[Message::user("北京天气?")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
         // tools 进 wire
@@ -1017,11 +1171,7 @@ mod tests {
         // Anthropic 用 input_schema 而不是 parameters。
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "get_weather".into(),
-            description: Some("查天气".into()),
-            parameters: serde_json::json!({"type":"object"}),
-        });
+        params.tools.push(Tool { name: "get_weather".into(), description: Some("查天气".into()), parameters: serde_json::json!({"type":"object"}), strict: None });
         let req = client.build_anthropic_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
         assert_eq!(j["tools"][0]["name"], "get_weather");
@@ -1078,11 +1228,7 @@ mod tests {
     fn openai_tool_choice_auto_with_tools_emits_string_auto() {
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "x".into(),
-            description: None,
-            parameters: serde_json::json!({}),
-        });
+        params.tools.push(Tool { name: "x".into(), description: None, parameters: serde_json::json!({}), strict: None });
         let req = client.build_openai_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
         assert_eq!(j["tool_choice"], "auto");
@@ -1092,11 +1238,7 @@ mod tests {
     fn openai_tool_choice_required_emits_string_required() {
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "x".into(),
-            description: None,
-            parameters: serde_json::json!({}),
-        });
+        params.tools.push(Tool { name: "x".into(), description: None, parameters: serde_json::json!({}), strict: None });
         params.tool_choice = ToolChoice::Required;
         let req = client.build_openai_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
@@ -1107,11 +1249,7 @@ mod tests {
     fn openai_tool_choice_specific_emits_function_object() {
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "get_weather".into(),
-            description: None,
-            parameters: serde_json::json!({}),
-        });
+        params.tools.push(Tool { name: "get_weather".into(), description: None, parameters: serde_json::json!({}), strict: None });
         params.tool_choice = ToolChoice::Specific("get_weather".into());
         let req = client.build_openai_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
@@ -1123,11 +1261,7 @@ mod tests {
     fn openai_tool_choice_none_emits_string_none() {
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "x".into(),
-            description: None,
-            parameters: serde_json::json!({}),
-        });
+        params.tools.push(Tool { name: "x".into(), description: None, parameters: serde_json::json!({}), strict: None });
         params.tool_choice = ToolChoice::None;
         let req = client.build_openai_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
@@ -1148,11 +1282,7 @@ mod tests {
     fn anthropic_tool_choice_required_emits_type_any() {
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "x".into(),
-            description: None,
-            parameters: serde_json::json!({}),
-        });
+        params.tools.push(Tool { name: "x".into(), description: None, parameters: serde_json::json!({}), strict: None });
         params.tool_choice = ToolChoice::Required;
         let req = client.build_anthropic_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
@@ -1163,11 +1293,7 @@ mod tests {
     fn anthropic_tool_choice_specific_emits_type_tool_with_name() {
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "get_weather".into(),
-            description: None,
-            parameters: serde_json::json!({}),
-        });
+        params.tools.push(Tool { name: "get_weather".into(), description: None, parameters: serde_json::json!({}), strict: None });
         params.tool_choice = ToolChoice::Specific("get_weather".into());
         let req = client.build_anthropic_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
@@ -1180,15 +1306,130 @@ mod tests {
         // Anthropic 没有 None 语义 —— 不传 tool_choice 字段。
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
         let mut params = GenerateParams::default();
-        params.tools.push(Tool {
-            name: "x".into(),
-            description: None,
-            parameters: serde_json::json!({}),
-        });
+        params.tools.push(Tool { name: "x".into(), description: None, parameters: serde_json::json!({}), strict: None });
         params.tool_choice = ToolChoice::None;
         let req = client.build_anthropic_request(&[Message::user("hi")], &params, false);
         let j = serde_json::to_value(&req).unwrap();
         assert!(j.get("tool_choice").is_none());
+    }
+
+    // ─── 流式超时单测 ──────────────────────────────────────────────
+    //
+    // 用 TcpListener 搭 mock SSE 服务器，验证双层超时模型：
+    //   1. idle 超时：首事件到达后，后续 chunk 间隔超过 idle 超时 -> 报错。
+    //   2. 长产出不超时：多个 chunk 持续到达（每个间隔 < idle 超时）-> 成功。
+
+    /// 构建测试用 Model，指向 mock 服务器地址。
+    fn model_at_addr(addr: std::net::SocketAddr) -> Model {
+        Model {
+            id: "test-model".into(),
+            name: "Test".into(),
+            api: ApiType::OpenAiCompletions,
+            provider: "test".into(),
+            base_url: format!("http://{addr}"),
+            api_key: "sk-test".into(),
+            context_window: 1024,
+            max_tokens: 256,
+            supports_thinking: false,
+            supports_vision: false,
+            cost_per_million_input: 0.0,
+            cost_per_million_output: 0.0,
+            timeout_secs: None,
+        }
+    }
+
+    /// 读取并丢弃 HTTP 请求行 + headers，直到空行。
+    async fn drain_http_request(stream: &mut tokio::net::TcpStream) {
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 4096];
+        // 简单策略：读一次即可，HTTP 请求头通常 < 4KB。
+        let _ = stream.read(&mut buf).await;
+    }
+
+    /// 发送 SSE 事件。
+    async fn send_sse(stream: &mut tokio::net::TcpStream, data: &str) {
+        use tokio::io::AsyncWriteExt;
+        let line = format!("data: {data}\n\n");
+        let _ = stream.write_all(line.as_bytes()).await;
+    }
+
+    /// 测试 idle 超时：首事件到达后，后续 chunk 间隔超过 idle 超时 -> Stream 错误。
+    ///
+    /// 方法：mock 服务器发送首个 SSE 事件后等待 3s（idle 超时设为 1s），
+    /// 客户端应在 1s idle 超时后返回 AiError::Stream。
+    #[tokio::test]
+    async fn chat_idle_timeout_triggers_stream_error() {
+        std::env::set_var("LATTE_AI_FIRST_EVENT_TIMEOUT_SECS", "5");
+        std::env::set_var("LATTE_AI_IDLE_TIMEOUT_SECS", "1");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drain_http_request(&mut stream).await;
+            // 发送 HTTP 响应头
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").await;
+            // 发送首个事件
+            send_sse(&mut stream, r#"{"choices":[{"delta":{"content":"hello"}}]}"#).await;
+            // 等待 3s（超过 idle 超时 1s）
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            // 此时客户端应该已经超时断开了
+            send_sse(&mut stream, r#"{"choices":[{"delta":{"content":" world"}}]}"#).await;
+        });
+
+        let client = AiClient::new(model_at_addr(addr)).unwrap();
+        let result = client.chat(&[Message::user("hi")], &GenerateParams::default()).await;
+
+        assert!(result.is_err(), "应该因 idle 超时而失败");
+        match result.unwrap_err() {
+            AiError::Stream(msg) => assert!(msg.contains("空闲超时"), "got: {msg}"),
+            other => panic!("expected AiError::Stream, got {other:?}"),
+        }
+
+        std::env::remove_var("LATTE_AI_FIRST_EVENT_TIMEOUT_SECS");
+        std::env::remove_var("LATTE_AI_IDLE_TIMEOUT_SECS");
+    }
+
+    /// 测试长产出不超时：多个 SSE chunk 持续到达（每个间隔 < idle 超时），
+    /// 总时间无上限 -> 应成功返回完整 Completion。
+    ///
+    /// 方法：mock 服务器发送 10 个事件（间隔 0.3s），idle 超时设为 2s。
+    /// 总时间 3s（远小于旧的总死线 300s，但验证了"只要 token 在流不过期"的机制）。
+    #[tokio::test]
+    async fn chat_long_output_does_not_timeout() {
+        std::env::set_var("LATTE_AI_FIRST_EVENT_TIMEOUT_SECS", "5");
+        std::env::set_var("LATTE_AI_IDLE_TIMEOUT_SECS", "2");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            drain_http_request(&mut stream).await;
+            use tokio::io::AsyncWriteExt;
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n").await;
+            // 发送 10 个事件，每个间隔 0.3s（< idle 超时 2s）
+            for i in 0..10u32 {
+                send_sse(&mut stream, &format!(r#"{{"choices":[{{"delta":{{"content":"chunk{i}"}}}}]}}"#)).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            // 发送 [DONE]
+            send_sse(&mut stream, "[DONE]").await;
+        });
+
+        let client = AiClient::new(model_at_addr(addr)).unwrap();
+        let result = client.chat(&[Message::user("hi")], &GenerateParams::default()).await;
+
+        assert!(result.is_ok(), "长产出不应超时: {:?}", result.err());
+        let completion = result.unwrap();
+        assert!(completion.content.contains("chunk0"), "content: {}", completion.content);
+        assert!(completion.content.contains("chunk9"), "content: {}", completion.content);
+        assert_eq!(completion.stop_reason, "", "stop_reason 应为空（无 finish_reason chunk）");
+
+        std::env::remove_var("LATTE_AI_FIRST_EVENT_TIMEOUT_SECS");
+        std::env::remove_var("LATTE_AI_IDLE_TIMEOUT_SECS");
     }
 }
 

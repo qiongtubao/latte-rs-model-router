@@ -196,6 +196,7 @@ fn entry_to_model(entry: &ModelEntry) -> Model {
         supports_vision: entry.supports_vision,
         cost_per_million_input: 0.0,
         cost_per_million_output: 0.0,
+        timeout_secs: None,
     }
 }
 
@@ -468,6 +469,9 @@ async fn run_chat(
                             }
                         }
                         StreamEvent::Done { usage: u, .. } => usage = u,
+                        StreamEvent::HttpError { status, message } => {
+                            eprintln!("\n  HTTP {}: {}", status, message.to_string().red());
+                        }
                         StreamEvent::Error(e) => eprintln!("\n  {}", e.to_string().red()),
                     }
                 }
@@ -516,6 +520,9 @@ async fn run_chat(
                         }
                     }
                     StreamEvent::Done { usage: u, .. } => usage = u,
+                    StreamEvent::HttpError { status, message } => {
+                        eprintln!("\n  HTTP {}: {}", status, message.to_string().red());
+                    }
                     StreamEvent::Error(e) => eprintln!("\n  {}", e.to_string().red()),
                 }
             }
@@ -732,6 +739,7 @@ fn build_model(
         supports_vision: false,
         cost_per_million_input: 0.0,
         cost_per_million_output: 0.0,
+        timeout_secs: None,
     }
 }
 

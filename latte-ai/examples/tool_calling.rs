@@ -40,6 +40,7 @@ async fn main() -> Result<()> {
         supports_vision: false,
         cost_per_million_input: 0.0,
         cost_per_million_output: 0.0,
+        timeout_secs: None,
     };
     let client = AiClient::new(model)?;
 
@@ -55,6 +56,7 @@ async fn main() -> Result<()> {
                 },
                 "required": ["city"]
             }),
+            strict: None,
         },
         Tool {
             name: "celsius_to_fahrenheit".into(),
@@ -66,6 +68,7 @@ async fn main() -> Result<()> {
                 },
                 "required": ["celsius"]
             }),
+            strict: None,
         },
     ];
 

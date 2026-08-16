@@ -53,6 +53,13 @@ pub struct Model {
 
     /// Cost per million output tokens (USD).
     pub cost_per_million_output: f64,
+
+    /// Per-request timeout in seconds. `None` → 300s default (hardcoded
+    /// in `AiClient::new`). Lets heavy long-context roles (architect
+    /// building a large structure) raise their ceiling instead of
+    /// tripping the HTTP client timeout mid-request.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// One piece of a message's content — either plain text or an inline image.
@@ -245,13 +252,22 @@ pub struct TokenUsage {
     pub thinking_tokens: u32,
 }
 
-/// 工具描述（请求侧）。
+/// 工具描述（请求侧）。字段对齐 OpenAI `tools[].function` 与 Anthropic
+/// `tools[]` 两种 wire 形态：`strict` 仅 OpenAI 有效（Anthropic 无此字段，
+/// 序列化时跳过）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: serde_json::Value,
+    /// OpenAI Structured Outputs 开关。`Some(true)` -> wire 上带
+    /// `"strict": true`，要求模型严格按 `parameters` schema 输出
+    /// （需 schema 满足：所有 properties 进 required、
+    /// `additionalProperties: false`）。`None`/`Some(false)` 不传该字段。
+    /// Anthropic 协议无 strict 概念，序列化时忽略。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 /// 模型请求调用某个工具（响应侧）。
@@ -374,7 +390,13 @@ pub enum StreamEvent {
         content: Vec<ContentPart>,
         tool_calls: Vec<ToolCall>,
         usage: TokenUsage,
+        /// 生成停止原因（如 "stop", "tool_calls", "end_turn"）。
+        /// 流式传输从 SSE 的 finish_reason / message_delta 中提取。
+        stop_reason: String,
     },
+    /// HTTP 级别错误（非 200 状态码）。保留 status code 让上游
+    /// `cooldown_for_error` 能按状态码决定冷却策略。
+    HttpError { status: u16, message: String },
     Error(String),
 }
 
@@ -458,6 +480,9 @@ pub(crate) struct OpenAiFunction {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub parameters: serde_json::Value,
+    /// OpenAI Structured Outputs 开关，透传自 `Tool::strict`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
 }
 
 #[derive(Deserialize, Clone, Serialize)]
@@ -696,8 +721,8 @@ pub(crate) struct AnthropicStreamEvent {
 #[derive(Deserialize)]
 pub(crate) struct AnthropicStreamDelta {
     pub text: Option<String>,
-    #[serde(rename = "type")]
-    pub type_: Option<String>,
+    /// message_delta 事件携带的 stop_reason（end_turn / tool_use / max_tokens 等）。
+    pub stop_reason: Option<String>,
     pub thinking: Option<String>,
     #[serde(default)]
     pub partial_json: Option<String>,
