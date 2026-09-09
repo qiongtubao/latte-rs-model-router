@@ -868,7 +868,7 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
         // 输出上限只在这一处决策，随后按 `max_tokens_field` 落到两个互斥
         // 字段之一（`None` 时两个都省略，交给厂商默认值）。
         let cap = Self::effective_max_tokens(params.max_tokens, &self.model);
-        OpenAiChatRequest {
+        let mut req = OpenAiChatRequest {
             model: self.model.id.clone(),
             messages: messages.iter().map(|m| {
                 // `Role::Tool` 的 content 必须是 string（OpenAI 协议要求）。
@@ -899,6 +899,7 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                             // （"must not be empty"），给一个占位空格。
                             OpenAiMessageContent::Parts(vec![OpenAiContentPart::Text {
                                 text: " ".into(),
+                                cache_control: None,
                             }])
                         } else {
                             OpenAiMessageContent::Parts(parts)
@@ -973,7 +974,15 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
             } else {
                 None
             },
+        };
+
+        // OpenAI-compatible 路径的 prompt caching：**按模型开关**下发。
+        // 不认 `cache_control` 的端点看到未知字段会 400，所以默认关，
+        // 只在确认支持的端点上开（见 `Model::prompt_cache`）。
+        if self.model.prompt_cache {
+            apply_openai_cache_breakpoints(&mut req);
         }
+        req
     }
 
     fn build_anthropic_request(
@@ -999,11 +1008,32 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
             budget_tokens: tb.token_budget(),
         });
 
-        AnthropicRequest {
+        // system 提到顶层：规范缓存顺序是 tools → system → messages，
+        // 断点必须落在稳定的头部才能让"巨大且不变的前缀"每轮命中缓存。
+        // 从前把 Role::System 转成 user 消息塞进 messages，头部无处可锚。
+        //
+        // 多条 System 消息按出现顺序合并成多个 block（保持字节稳定：
+        // 同一会话里同样的输入产生同样的数组）。
+        let system: Vec<AnthropicSystemBlock> = messages
+            .iter()
+            .filter(|m| m.role == Role::System)
+            .flat_map(|m| {
+                m.content.iter().filter_map(|p| match p {
+                    ContentPart::Text { text } if !text.is_empty() => {
+                        Some(AnthropicSystemBlock::text(text.clone()))
+                    }
+                    _ => None,
+                })
+            })
+            .collect();
+
+        let mut req = AnthropicRequest {
             model: self.model.id.clone(),
+            system,
             // Anthropic 没有 tool role —— `Role::Tool` 转成 user role
-            // 消息 + 一个 tool_result block。
-            messages: messages.iter().map(|m| {
+            // 消息 + 一个 tool_result block。System 已提到顶层 system
+            // 数组，这里跳过，避免重复下发。
+            messages: messages.iter().filter(|m| m.role != Role::System).map(|m| {
                 let role = match m.role {
                     Role::System => "user",
                     Role::User => "user",
@@ -1024,6 +1054,7 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                             tool_use_id,
                             content: body,
                             is_error: None,
+                            cache_control: None,
                         }]
                     }
                     _ => {
@@ -1035,7 +1066,7 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                             .map(to_anthropic_content_block)
                             .collect();
                         if blocks.is_empty() {
-                            vec![AnthropicContentBlock::Text { text: " ".into() }]
+                            vec![AnthropicContentBlock::Text { text: " ".into(), cache_control: None }]
                         } else {
                             blocks
                         }
@@ -1052,6 +1083,7 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                 name: t.name.clone(),
                 description: t.description.clone(),
                 input_schema: t.parameters.clone(),
+                cache_control: None,
             }).collect(),
             tool_choice: if params.tools.is_empty() && params.tool_choice == ToolChoice::Auto {
                 None
@@ -1059,8 +1091,131 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                 AnthropicToolChoice::from(&params.tool_choice)
             },
             thinking,
+        };
+
+        // ── 4 断点 prompt caching ─────────────────────────────────────
+        //
+        // Anthropic 每请求最多 4 个断点。预算分配（对齐 Claude Code / Pi
+        // 这些一方客户端的放法）：
+        //   1 个 → 最后一个 tool     （工具定义前缀）
+        //   1 个 → 最后一个 system block（连带缓存它前面的全部 tools）
+        //   2 个 → 消息尾部滚动窗口   （随对话增长滚动命中）
+        //
+        // 为什么头部两个都要：规范缓存顺序 tools → system → messages，
+        // system 上的断点已覆盖整个 tools+system 前缀；额外给 tools 一个，
+        // 是为了 system 文本变化时工具定义**仍然**留在缓存里（system
+        // prompt 常随角色/轮次微调，工具定义几乎不变）。
+        apply_anthropic_cache_breakpoints(&mut req);
+        req
+    }
+}
+
+/// OpenAI-compatible 端点的断点放置：system 头部（最多 2 条）+ 消息尾部
+/// （最多 2 条），共 ≤ 4，与 Anthropic 原生路径同一预算。
+///
+/// 兼容端点没有独立的顶层 system 数组，system 就是 messages 里的头几条，
+/// 所以头部断点直接挂在 system 消息上（对齐 opencode 的
+/// `applyCaching`：`system.slice(0,2)` + `final.slice(-2)`）。
+///
+/// **只在已经是 `Parts` 形态的 content 上挂**：把 `String` 强行转成
+/// `Parts` 会改变消息形状，个别兼容端点对此敏感（空 text block、结构化
+/// content 的支持度参差）。宁可少挂一个断点，也不要为了挂断点去改本来
+/// 能用的请求形状。
+fn apply_openai_cache_breakpoints(req: &mut OpenAiChatRequest) {
+    // 头部：前两条 system 消息。
+    let mut head = 0usize;
+    for msg in req.messages.iter_mut() {
+        if head >= 2 {
+            break;
+        }
+        if msg.role != "system" {
+            // system 只可能在最前面连续出现，遇到非 system 即停。
+            break;
+        }
+        if mark_openai_last_text(&mut msg.content) {
+            head += 1;
         }
     }
+    // 尾部：最后两条消息（滚动窗口，让上一轮的尾部在这一轮变成可命中的
+    // 前缀内部）。
+    let mut tail = 0usize;
+    for msg in req.messages.iter_mut().rev() {
+        if tail >= 2 {
+            break;
+        }
+        if mark_openai_last_text(&mut msg.content) {
+            tail += 1;
+        }
+    }
+}
+
+/// 在一条 OpenAI 消息的最后一个 text part 上挂断点。content 为
+/// `String` 形态时**不动**（见 `apply_openai_cache_breakpoints` 的说明）。
+/// 返回是否成功放置。
+fn mark_openai_last_text(content: &mut OpenAiMessageContent) -> bool {
+    let OpenAiMessageContent::Parts(parts) = content else {
+        return false;
+    };
+    for part in parts.iter_mut().rev() {
+        if let OpenAiContentPart::Text { cache_control, .. } = part {
+            if cache_control.is_none() {
+                *cache_control = Some(AnthropicCacheControl::ephemeral());
+            }
+            return true;
+        }
+    }
+    false
+}
+
+/// 放置 Anthropic prompt caching 断点：头部 2（tools 末尾 + system 末尾）
+/// + 消息尾部 2（滚动窗口）。
+///
+/// 幂等：只在尚无断点处写入。调用方每轮重建请求，因此不会累积。
+fn apply_anthropic_cache_breakpoints(req: &mut AnthropicRequest) {
+    // 头部：最后一个 tool。
+    if let Some(last) = req.tools.last_mut() {
+        if last.cache_control.is_none() {
+            last.cache_control = Some(AnthropicCacheControl::ephemeral());
+        }
+    }
+    // 头部：最后一个 system block。
+    if let Some(last) = req.system.last_mut() {
+        if last.cache_control.is_none() {
+            last.cache_control = Some(AnthropicCacheControl::ephemeral());
+        }
+    }
+    // 尾部：最近两条消息各挂一个，落在该消息的最后一个可承载 block 上。
+    // 滚动窗口的意义：上一轮的尾部断点在这一轮变成"前缀内部"，于是这一轮
+    // 的前缀能命中上一轮写入的缓存；只挂一个的话，每轮新增内容都在断点
+    // 之后、永远进不了缓存。
+    let mut placed = 0usize;
+    for msg in req.messages.iter_mut().rev() {
+        if placed >= 2 {
+            break;
+        }
+        if apply_cache_control_to_last_block(&mut msg.content) {
+            placed += 1;
+        }
+    }
+}
+
+/// 把断点挂在一组 content block 的**最后一个可承载者**上（text /
+/// tool_result）。image / tool_use 不承载 cache_control。
+/// 返回是否成功放置。
+fn apply_cache_control_to_last_block(blocks: &mut [AnthropicContentBlock]) -> bool {
+    for block in blocks.iter_mut().rev() {
+        match block {
+            AnthropicContentBlock::Text { cache_control, .. }
+            | AnthropicContentBlock::ToolResult { cache_control, .. } => {
+                if cache_control.is_none() {
+                    *cache_control = Some(AnthropicCacheControl::ephemeral());
+                }
+                return true;
+            }
+            _ => continue,
+        }
+    }
+    false
 }
 
 
@@ -1091,7 +1246,7 @@ fn merge_openai_text(content: Option<OpenAiResponseContent>) -> Vec<ContentPart>
 fn merge_anthropic_text(blocks: &[AnthropicContentBlock]) -> Vec<ContentPart> {
     let mut out: Vec<ContentPart> = Vec::new();
     for b in blocks {
-        if let AnthropicContentBlock::Text { text } = b {
+        if let AnthropicContentBlock::Text { text, .. } = b {
             out.push(ContentPart::Text { text: text.clone() });
         }
     }
@@ -1189,6 +1344,7 @@ mod tests {
             max_tokens: 256,
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
+        prompt_cache: false,
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,
@@ -1404,15 +1560,145 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_request_system_message_uses_user_role() {
-        // 历史约定：Anthropic 没有 system role，build_anthropic_request
-        // 把 Role::System 转成 user 角色。这条行为可能改但目前是这样。
+    fn anthropic_request_hoists_system_to_top_level() {
+        // 行为变更：`Role::System` 不再转成 user 消息塞进 messages，而是
+        // 提到顶层 `system` 数组。规范缓存顺序是 tools → system →
+        // messages，断点必须落在稳定头部才能让"巨大且不变的前缀"命中；
+        // 从前的 system-as-user 让头部无处可锚。
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
         let params = GenerateParams::default();
-        let msgs = vec![Message::system("you are helpful")];
+        let msgs = vec![Message::system("you are helpful"), Message::user("hi")];
         let req = client.build_anthropic_request(&msgs, &params, false);
         let j = serde_json::to_value(&req).unwrap();
+        assert_eq!(j["system"][0]["type"], "text");
+        assert_eq!(j["system"][0]["text"], "you are helpful");
+        // messages 里只剩真正的对话消息，system 不再重复下发。
+        assert_eq!(j["messages"].as_array().unwrap().len(), 1);
         assert_eq!(j["messages"][0]["role"], "user");
+        assert_eq!(j["messages"][0]["content"][0]["text"], "hi");
+    }
+
+    /// 4 断点预算分配：tools 末尾 1 + system 末尾 1 + 消息尾部 2。
+    ///
+    /// 这是 22.7 倍上下文放大的对症解法：工具循环每轮重传全部历史，其中
+    /// 最大且最不变的部分（工具定义 + system prompt）每轮重新计费。
+    #[test]
+    fn anthropic_request_places_four_cache_breakpoints() {
+        let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
+        let mut params = GenerateParams::default();
+        params.tools = vec![
+            Tool {
+                name: "a".into(),
+                description: Some("first".into()),
+                parameters: serde_json::json!({"type":"object"}),
+                strict: None,
+            },
+            Tool {
+                name: "b".into(),
+                description: Some("last".into()),
+                parameters: serde_json::json!({"type":"object"}),
+                strict: None,
+            },
+        ];
+        let msgs = vec![
+            Message::system("sys one"),
+            Message::system("sys two"),
+            Message::user("turn 1"),
+            Message::assistant("reply 1"),
+            Message::user("turn 2"),
+        ];
+        let req = client.build_anthropic_request(&msgs, &params, false);
+        let j = serde_json::to_value(&req).unwrap();
+
+        // 头部断点 1：只挂最后一个 tool。
+        assert!(j["tools"][0].get("cache_control").is_none(), "非末尾 tool 不挂");
+        assert_eq!(j["tools"][1]["cache_control"]["type"], "ephemeral");
+        // 头部断点 2：只挂最后一个 system block。
+        assert!(j["system"][0].get("cache_control").is_none(), "非末尾 system 不挂");
+        assert_eq!(j["system"][1]["cache_control"]["type"], "ephemeral");
+
+        // 尾部断点：最近两条消息各一个（滚动窗口），更早的不挂。
+        let msgs_json = j["messages"].as_array().unwrap();
+        assert_eq!(msgs_json.len(), 3);
+        let has_bp = |m: &serde_json::Value| {
+            m["content"]
+                .as_array()
+                .map(|blocks| blocks.iter().any(|b| b.get("cache_control").is_some()))
+                .unwrap_or(false)
+        };
+        assert!(!has_bp(&msgs_json[0]), "最早的消息不该挂断点");
+        assert!(has_bp(&msgs_json[1]), "倒数第二条应挂");
+        assert!(has_bp(&msgs_json[2]), "最后一条应挂");
+
+        // 总数不超过 Anthropic 的 4 断点上限。
+        let count = |v: &serde_json::Value| -> usize {
+            fn walk(v: &serde_json::Value, n: &mut usize) {
+                match v {
+                    serde_json::Value::Object(map) => {
+                        if map.contains_key("cache_control") && !map["cache_control"].is_null() {
+                            *n += 1;
+                        }
+                        for (_, sub) in map {
+                            walk(sub, n);
+                        }
+                    }
+                    serde_json::Value::Array(arr) => arr.iter().for_each(|s| walk(s, n)),
+                    _ => {}
+                }
+            }
+            let mut n = 0;
+            walk(v, &mut n);
+            n
+        };
+        assert_eq!(count(&j), 4, "恰好用满 4 个断点、不超预算: {j}");
+    }
+
+    /// 没有 system / 没有 tools 时不应崩、也不浪费断点。
+    #[test]
+    fn anthropic_cache_breakpoints_degrade_without_head() {
+        let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
+        let params = GenerateParams::default();
+        let msgs = vec![Message::user("only one turn")];
+        let req = client.build_anthropic_request(&msgs, &params, false);
+        let j = serde_json::to_value(&req).unwrap();
+        assert!(j.get("system").is_none() || j["system"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        assert!(j.get("tools").is_none() || j["tools"].as_array().map(|a| a.is_empty()).unwrap_or(true));
+        // 唯一那条消息仍应拿到一个尾部断点。
+        assert_eq!(j["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// OpenAI-compatible 路径：`prompt_cache` **关**（默认）时一个断点都
+    /// 不下发——不认该字段的端点会 400，这是默认关的理由。
+    #[test]
+    fn openai_cache_breakpoints_are_off_by_default() {
+        let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
+        let params = GenerateParams::default();
+        let msgs = vec![Message::system("sys"), Message::user("hi")];
+        let req = client.build_openai_request(&msgs, &params, false);
+        let j = serde_json::to_value(&req).unwrap();
+        let s = serde_json::to_string(&j).unwrap();
+        assert!(!s.contains("cache_control"), "默认必须一个断点都不发: {s}");
+    }
+
+    /// `prompt_cache` 开启时按 system 头 2 + 尾部 2 放断点，且不超 4。
+    #[test]
+    fn openai_cache_breakpoints_apply_when_enabled() {
+        let mut model = model_with_key(ApiType::OpenAiCompletions, "sk-test");
+        model.prompt_cache = true;
+        let client = AiClient::new(model).unwrap();
+        let params = GenerateParams::default();
+        let msgs = vec![
+            Message::system("sys one"),
+            Message::system("sys two"),
+            Message::user("turn 1"),
+            Message::assistant("reply 1"),
+            Message::user("turn 2"),
+        ];
+        let req = client.build_openai_request(&msgs, &params, false);
+        let j = serde_json::to_value(&req).unwrap();
+        let n = serde_json::to_string(&j).unwrap().matches("cache_control").count();
+        assert!(n > 0, "开启后应下发断点");
+        assert!(n <= 4, "断点数不得超过 4，实际 {n}");
     }
 
     // ─── ToolChoice wire 序列化 ────────────────────────────────────────
@@ -1531,6 +1817,7 @@ mod tests {
             max_tokens: 256,
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
+        prompt_cache: false,
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,

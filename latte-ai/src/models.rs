@@ -107,6 +107,22 @@ pub struct Model {
     #[serde(default)]
     pub max_tokens_field: MaxTokensField,
 
+    /// OpenAI-compatible 路径是否下发 Anthropic 式的 `cache_control`
+    /// 断点（prompt caching）。
+    ///
+    /// **默认关**，因为并非所有兼容端点认这个字段——不认的那些看到未知
+    /// 字段会 400，等于把可用的模型打挂。只在确认支持的端点上开
+    /// （OpenRouter 转 Claude、DeepSeek 的上下文缓存、Qwen/阿里云等）。
+    ///
+    /// Anthropic 原生协议（[`ApiType::AnthropicMessages`]）**不看这个
+    /// 开关**：那条路的 caching 是协议一等公民，恒开。
+    ///
+    /// 对齐 oh-my-pi 的 `Model.compat.cacheControlFormat`（值为
+    /// `"anthropic"` 时才在兼容端点上注入断点）——它同样是按模型声明、
+    /// 而不是无条件下发。
+    #[serde(default)]
+    pub prompt_cache: bool,
+
     /// Whether the model supports thinking/reasoning.
     pub supports_thinking: bool,
 
@@ -549,7 +565,12 @@ pub(crate) struct OpenAiMessage {
 #[derive(Serialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum OpenAiContentPart {
-    Text { text: String },
+    Text {
+        text: String,
+        /// Anthropic 式断点，仅当 `Model::prompt_cache` 开启时写入。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
     ImageUrl { image_url: OpenAiImageUrl },
 }
 
@@ -616,7 +637,7 @@ pub(crate) struct OpenAiFunctionCallDelta {
 /// into a `data:` URL.
 pub(crate) fn to_openai_content_part(p: &ContentPart) -> OpenAiContentPart {
     match p {
-        ContentPart::Text { text } => OpenAiContentPart::Text { text: text.clone() },
+        ContentPart::Text { text } => OpenAiContentPart::Text { text: text.clone(), cache_control: None },
         ContentPart::Image { media_type, data } => {
             let url = format!("data:{};base64,{}", media_type, BASE64.encode(data));
             OpenAiContentPart::ImageUrl {
@@ -707,9 +728,57 @@ pub(crate) struct OpenAiDelta {
 //   {"type": "text",  "text": "..."}
 //   {"type": "image", "source": {"type": "base64", "media_type": "...", "data": "..."}}
 
+/// Anthropic prompt caching 断点标记。挂在 tool / system block / content
+/// block 上，表示"缓存到此处为止的前缀"。
+///
+/// 为什么需要它（实测实锤：latte 单会话 22.19M 输入 token，工具结果唯一
+/// 内容仅 0.97M —— **22.7 倍放大**，单子会话最高 105 倍）：工具循环每轮
+/// 都重传全部历史，而其中最大且最不变的部分（工具定义 + system prompt）
+/// 每轮都被重新计费。压缩工具结果只覆盖约 30% 的内容、实测把 105x 降到
+/// 90x；缓存前缀才是对症的解法——它不丢任何信息，且直接命中那 70%。
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// 可选的缓存保留时长（`"1h"` = 长保留）。缺省是 5 分钟。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+impl AnthropicCacheControl {
+    /// 默认（5 分钟）断点。
+    pub fn ephemeral() -> Self {
+        Self { type_: "ephemeral".into(), ttl: None }
+    }
+}
+
+/// 顶层 `system` 数组的一个块。
+///
+/// 从前 latte 把 `Role::System` 转成 `user` 消息塞进 messages —— 语义上
+/// 不对（system prompt 本该走 system 字段），而且**头部缓存无处可锚**：
+/// Anthropic 的规范缓存顺序是 tools → system → messages，断点必须落在
+/// 稳定的头部才能让"巨大且不变的前缀"每轮命中。
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub(crate) struct AnthropicSystemBlock {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
+}
+
+impl AnthropicSystemBlock {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self { type_: "text".into(), text: text.into(), cache_control: None }
+    }
+}
+
 #[derive(Serialize)]
 pub(crate) struct AnthropicRequest {
     pub model: String,
+    /// 顶层 system 数组（规范缓存顺序里排在 tools 之后、messages 之前）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub system: Vec<AnthropicSystemBlock>,
     pub messages: Vec<AnthropicMessage>,
     pub max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -734,6 +803,9 @@ pub(crate) struct AnthropicTool {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: serde_json::Value,
+    /// 断点：挂在**最后一个**工具上就缓存了整个 tools 前缀。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<AnthropicCacheControl>,
 }
 
 #[derive(Serialize, Clone)]
@@ -745,7 +817,13 @@ pub(crate) struct AnthropicMessage {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum AnthropicContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+        /// 消息尾部断点挂在 text block 上（Anthropic 要求 cache_control
+        /// 落在具体的 content block，不是整条消息）。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
+    },
     Image { source: AnthropicImageSource },
     ToolUse {
         id: String,
@@ -757,6 +835,8 @@ pub(crate) enum AnthropicContentBlock {
         content: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<AnthropicCacheControl>,
     },
 }
 
@@ -773,7 +853,7 @@ pub(crate) struct AnthropicImageSource {
 /// base64-encoded into the `source.data` field.
 pub(crate) fn to_anthropic_content_block(p: &ContentPart) -> AnthropicContentBlock {
     match p {
-        ContentPart::Text { text } => AnthropicContentBlock::Text { text: text.clone() },
+        ContentPart::Text { text } => AnthropicContentBlock::Text { text: text.clone(), cache_control: None },
         ContentPart::Image { media_type, data } => AnthropicContentBlock::Image {
             source: AnthropicImageSource {
                 type_: "base64".to_string(),
@@ -885,7 +965,7 @@ pub(crate) fn extract_anthropic_response(
     let mut calls: Vec<ToolCall> = Vec::new();
     for b in blocks {
         match b {
-            AnthropicContentBlock::Text { text } => parts.push(ContentPart::Text { text }),
+            AnthropicContentBlock::Text { text, .. } => parts.push(ContentPart::Text { text }),
             AnthropicContentBlock::Image { source } => match BASE64.decode(&source.data) {
                 Ok(data) => parts.push(ContentPart::Image {
                     media_type: source.media_type,

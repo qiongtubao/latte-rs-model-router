@@ -26,6 +26,9 @@
 //!     // `max_tokens_field` 选 `max_completion_tokens`（较新的兼容端点只认它）。
 //!     omit_max_tokens: false,
 //!     max_tokens_field: MaxTokensField::MaxTokens,
+//!     // prompt caching：兼容端点默认关（不认该字段的会 400）；
+//!     // Anthropic 原生协议恒开、不看这个开关。
+//!     prompt_cache: false,
 //!     supports_thinking: false,
 //!     supports_vision: false,
 //!     cost_per_million_input: 0.27,
