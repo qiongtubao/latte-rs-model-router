@@ -52,6 +52,23 @@ pub struct GenerateParams {
     /// OpenAI 协议下 `None` 表示显式禁调；Anthropic 协议下不支持 None。
     #[serde(default)]
     pub tool_choice: crate::models::ToolChoice,
+
+    /// 是否允许模型在**一条响应里返回多个 tool_call**（OpenAI 协议的
+    /// `parallel_tool_calls`）。
+    ///
+    /// - `None`（默认）→ 字段不下发，走供应商默认（OpenAI 兼容端点默认 `true`）；
+    /// - `Some(true)` → 显式要求可并行；
+    /// - `Some(false)` → 强制每轮最多一个工具调用。
+    ///
+    /// 为什么要能显式 `None`：并非所有 OpenAI 兼容端点都认这个字段，
+    /// 见 litellm #22637（Bedrock Converse 在 Claude 4.5+ 上收到它直接失败）。
+    /// 遇到这种端点把它设回 `None` 即可，不必改协议实现。
+    ///
+    /// Anthropic 协议没有对应的**开启**开关（默认就允许并行），只有
+    /// `tool_choice.disable_parallel_tool_use` 能关，因此这个字段在
+    /// Anthropic 路径上不下发。
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
 }
 
 /// Thinking/reasoning budget levels.
@@ -95,6 +112,7 @@ impl GenerateParams {
             seed: None,
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
+            parallel_tool_calls: None,
         }
     }
 
@@ -114,6 +132,7 @@ impl GenerateParams {
             seed: None,
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
+            parallel_tool_calls: None,
         }
     }
 
@@ -133,6 +152,7 @@ impl GenerateParams {
             seed: None,
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
+            parallel_tool_calls: None,
         }
     }
 
@@ -190,6 +210,7 @@ impl Default for GenerateParams {
             seed: None,
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
+            parallel_tool_calls: None,
         }
     }
 }

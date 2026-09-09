@@ -36,6 +36,8 @@ async fn main() -> Result<()> {
         api_key: std::env::var("DEEPSEEK_API_KEY").unwrap_or_default(),
         context_window: 65536,
         max_tokens: 4096,
+        omit_max_tokens: false,
+        max_tokens_field: Default::default(),
         supports_thinking: false,
         supports_vision: false,
         cost_per_million_input: 0.0,

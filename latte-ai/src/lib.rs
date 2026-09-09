@@ -21,6 +21,11 @@
 //!     api_key: std::env::var("DEEPSEEK_API_KEY").unwrap_or_default(),
 //!     context_window: 65536,
 //!     max_tokens: 8192,
+//!     // 出站输出上限的两个可选开关（缺省即旧行为）：
+//!     // `omit_max_tokens: true` 完全不下发该字段（代理转发到未知后端时用）；
+//!     // `max_tokens_field` 选 `max_completion_tokens`（较新的兼容端点只认它）。
+//!     omit_max_tokens: false,
+//!     max_tokens_field: MaxTokensField::MaxTokens,
 //!     supports_thinking: false,
 //!     supports_vision: false,
 //!     cost_per_million_input: 0.27,
@@ -54,7 +59,8 @@ pub mod prelude {
     pub use crate::client::AiClient;
     pub use crate::error::Result;
     pub use crate::models::{
-        ApiType, Completion, Message, Model, Role, StreamEvent, TokenUsage, Tool, ToolCall,
+        ApiType, Completion, MaxTokensField, Message, Model, Role, StreamEvent, TokenUsage, Tool,
+        ToolCall,
     };
     pub use crate::params::{GenerateParams, ThinkingBudget};
 }

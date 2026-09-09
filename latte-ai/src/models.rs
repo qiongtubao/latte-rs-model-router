@@ -11,6 +11,47 @@ pub enum ApiType {
     AnthropicMessages,
 }
 
+/// Anthropic 协议在**完全没有配置输出上限**时兜的值。
+///
+/// 只有这一条协议需要它：`max_tokens` 是必填字段，省略请求直接被拒，所以
+/// 「什么都没配」也必须发一个数。OpenAI 那条路没配就整个省略字段，由厂商
+/// 默认值说话，不需要本常量。
+///
+/// 取 4096 与 [`crate::models::Model`] 的既有默认（以及 latte-agent-core
+/// `ModelDef` 的默认）保持一致。**它不是上限、不参与钳制**：只要目录或调用
+/// 方给了值，下发的就是那个值，本常量不出现在决策里。
+///
+/// # 这里曾经是一个绝对天花板
+///
+/// 早先版本有 `MAX_OUTPUT_TOKENS_CEILING = 64000`（取自 oh-my-pi 的
+/// `OPENAI_MAX_OUTPUT_TOKENS`），对所有请求做 `min()`。它被移除的理由不是
+/// 那个数不好，而是它**让配置项失去意义**：目录写 384000、实际发 64000、
+/// 且无任何日志，使用者改那个数不会看到任何变化。
+///
+/// 现在的契约：配置值原样下发，超了由厂商回 4xx 说清楚。诊断一个明确的
+/// 报错比诊断「为什么我改配置没反应」便宜得多。
+pub const ANTHROPIC_UNCONFIGURED_MAX_TOKENS: u32 = 4_096;
+
+/// 出站请求里"输出上限"用哪个字段名。
+///
+/// OpenAI 在 Chat Completions 上把 `max_tokens` 标记为 deprecated、改用
+/// `max_completion_tokens`，部分兼容端点只认后者。两者语义相同，只是名字
+/// 不同，所以这里只做名字选择，不改数值语义。
+///
+/// 缺省 `MaxTokens`：绝大多数兼容端点仍认它，且这是本改造之前的既有行为
+/// ——缺省值必须与旧行为一致，否则一次升级就把所有现存配置的行为改掉了。
+///
+/// 对齐 oh-my-pi 的 `maxTokensField`（`packages/catalog/src/types.ts:203`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MaxTokensField {
+    /// 传统字段名 `max_tokens`（默认）。
+    #[default]
+    MaxTokens,
+    /// 较新的 OpenAI Chat Completions 字段名 `max_completion_tokens`。
+    MaxCompletionTokens,
+}
+
 /// A model definition with its capabilities and connection details.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Model {
@@ -38,6 +79,33 @@ pub struct Model {
 
     /// Maximum output tokens.
     pub max_tokens: u32,
+
+    /// 完全**不下发**出站的输出上限字段（`max_tokens` /
+    /// `max_completion_tokens`），把每次响应的上限交给上游 API 决定。
+    ///
+    /// `max_tokens` 仍然有意义——它是本地预算的依据；这里压制的只是线上
+    /// 那个字段。
+    ///
+    /// 用于**代理**：它转发给一个我们无法探知真实输出上限的后端，发一个
+    /// 猜的值只会换来上游 400。实测场景：`vectide.cn` 这类 GLM 代理、
+    /// Ollama 之类的本地转发层。
+    ///
+    /// 对齐 oh-my-pi 的 `Model.omitMaxOutputTokens`（`packages/catalog/src/
+    /// types.ts`），它的注释把这条规则说得最准：*"Use this for proxies
+    /// (notably Ollama) that forward to a backend whose true output limit
+    /// OMP cannot discover — sending the wrong value triggers 400s from the
+    /// upstream provider."*
+    #[serde(default)]
+    pub omit_max_tokens: bool,
+
+    /// 出站请求里输出上限用哪个字段名。
+    ///
+    /// 较新的 OpenAI-compatible 端点废弃了 `max_tokens`、改用
+    /// `max_completion_tokens`；写死一个的后果是遇到新端点时**静默失效**
+    /// （字段被对方忽略，于是又回到"由厂商默认值说话"）。对齐 oh-my-pi 的
+    /// `maxTokensField`。
+    #[serde(default)]
+    pub max_tokens_field: MaxTokensField,
 
     /// Whether the model supports thinking/reasoning.
     pub supports_thinking: bool,
@@ -426,6 +494,9 @@ pub(crate) struct OpenAiChatRequest {
     pub repetition_penalty: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// 与 `max_tokens` 二者只发其一，取决于 [`MaxTokensField`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub stop: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,7 +505,28 @@ pub(crate) struct OpenAiChatRequest {
     pub tools: Vec<OpenAiTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_choice: Option<OpenAiToolChoice>,
+    /// 允许一条响应里返回多个 tool_call。省略时走供应商默认
+    /// （OpenAI 兼容端点默认 true）。见 `GenerateParams::parallel_tool_calls`
+    /// 里关于「有些端点不认这个字段」的说明。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_tool_calls: Option<bool>,
     pub stream: bool,
+    /// OpenAI 兼容端点在 **流式**下默认**不回** usage —— 必须显式请求
+    /// `{"include_usage": true}` 才会在 `[DONE]` 前多发一个只带 usage
+    /// 的 chunk。
+    ///
+    /// 动机（jemalloc 2026-08-26 会话）：`AiClient::chat()` 内部走的是
+    /// 流式传输，因为没带这个字段，所有 completion 的 `usage` 恒为
+    /// None，`TurnEnd.total_input/output/thinking` 全 0、UI 显示
+    /// "tokens: +0 in / +0 out"，token 与成本完全不可见。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<OpenAiStreamOptions>,
+}
+
+/// `stream_options` 载荷（仅流式请求携带）。
+#[derive(Serialize, Clone)]
+pub(crate) struct OpenAiStreamOptions {
+    pub include_usage: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -599,8 +691,14 @@ pub(crate) struct OpenAiStreamChoice {
 #[derive(Deserialize)]
 pub(crate) struct OpenAiDelta {
     pub content: Option<String>,
+    /// `Option` + `default`：同时容忍字段缺失与显式 `null`。
+    /// 国内 OpenAI 兼容网关（glm、MiniMax 等）常在流式 delta 里发
+    /// `"tool_calls": null`；用 `Vec` + `default` 会因
+    /// 「invalid type: null, expected a sequence」整块解析失败，
+    /// 连 chunk 里携带的正文 content 一起被丢弃（线上事故：
+    /// glm 备用通道因此表现为 empty completion）。
     #[serde(default)]
-    pub tool_calls: Vec<OpenAiToolCallDelta>,
+    pub tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 
 // ─── Anthropic wire format ────────────────────────────────────────
@@ -824,6 +922,31 @@ mod tests {
         let p = ContentPart::text("hello");
         let j = serde_json::to_value(&p).unwrap();
         assert_eq!(j, serde_json::json!({"type": "text", "text": "hello"}));
+    }
+
+    #[test]
+    fn stream_chunk_tolerates_null_tool_calls() {
+        // 线上事故：glm 等网关在流式 delta 里发 "tool_calls": null，
+        // Vec + default 无法容忍显式 null，整块解析失败、正文被丢弃。
+        let raw = r#"{"id":"chatcmpl-x","object":"chat.completion.chunk","created":1787000000,"model":"glm-5.2","choices":[{"index":0,"delta":{"role":"assistant","content":"你好","tool_calls":null},"finish_reason":null}]}"#;
+        let chunk: OpenAiStreamChunk = serde_json::from_str(raw).unwrap();
+        let choice = chunk.choices.into_iter().next().unwrap();
+        assert_eq!(choice.delta.content.as_deref(), Some("你好"));
+        assert!(choice.delta.tool_calls.is_none());
+    }
+
+    #[test]
+    fn stream_chunk_parses_real_tool_call_deltas() {
+        // 回归保护：正常工具调用 chunk 的 id/name/args 仍按序累积解析。
+        let raw = r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":"}}]},"finish_reason":null}]}"#;
+        let chunk: OpenAiStreamChunk = serde_json::from_str(raw).unwrap();
+        let calls = chunk.choices.into_iter().next().unwrap()
+            .delta.tool_calls.unwrap();
+        assert_eq!(calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(
+            calls[0].function.as_ref().unwrap().name.as_deref(),
+            Some("bash")
+        );
     }
 
     #[test]
