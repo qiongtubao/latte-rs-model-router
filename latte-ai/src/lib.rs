@@ -29,6 +29,7 @@
 //!     // prompt caching：兼容端点默认关（不认该字段的会 400）；
 //!     // Anthropic 原生协议恒开、不看这个开关。
 //!     prompt_cache: false,
+//!     prompt_cache_key: None,
 //!     supports_thinking: false,
 //!     supports_vision: false,
 //!     cost_per_million_input: 0.27,

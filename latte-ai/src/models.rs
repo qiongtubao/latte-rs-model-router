@@ -123,6 +123,23 @@ pub struct Model {
     #[serde(default)]
     pub prompt_cache: bool,
 
+    /// 是否下发顶层 `prompt_cache_key`（缓存亲和键）。
+    ///
+    /// `None`（默认）= 跟随全局默认（**开**，可用
+    /// `LATTE_AI_PROMPT_CACHE_KEY=0` 关）。`Some(false)` 给个别对未知字段
+    /// 严格 400 的端点用。
+    ///
+    /// 默认与 `prompt_cache` 相反（那个默认关），因为两者兼容风险不同一个
+    /// 量级：`prompt_cache_key` 是 OpenAI **官方文档化**的 chat completions
+    /// 参数，绝大多数兼容端点会忽略不认识的顶层字段；而 `cache_control` 是
+    /// 把 Anthropic 的结构塞进 OpenAI 的 body，触发 400 的概率高得多。
+    ///
+    /// 同款先例见 [`OpenAiChatRequest::stream_options`]：默认下发 + env
+    /// 兜底关闭。另外只有调用方**真的给了 key** 时字段才会出现，没接线的
+    /// 调用路径行为逐字节不变。
+    #[serde(default)]
+    pub prompt_cache_key: Option<bool>,
+
     /// Whether the model supports thinking/reasoning.
     pub supports_thinking: bool,
 
@@ -334,6 +351,24 @@ pub struct TokenUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub thinking_tokens: u32,
+    /// 命中 prompt 缓存的输入 token 数（`input_tokens` 的**子集**，不是
+    /// 额外量）。
+    ///
+    /// 为什么必须上报：缓存是否真的命中，只有供应商的 usage 说得准。此前
+    /// 这个数字完全不可见，于是「配了 caching」和「caching 真生效」无从
+    /// 区分——实测 jemalloc 2026-09-10 会话 22.19M 输入 token 全程零命中，
+    /// 却毫无迹象。对齐 oh-my-pi 的 `bench-cli` 从 usage 读
+    /// `cacheReadTokens` 产出 `prompt_cache_read_observed` 观测项的做法：
+    /// 不靠猜端点支持什么，直接看命中没有。
+    ///
+    /// 各家字段名不同，解析侧已归一：OpenAI 系
+    /// `prompt_tokens_details.cached_tokens`、DeepSeek
+    /// `prompt_cache_hit_tokens`、Anthropic `cache_read_input_tokens`。
+    /// 端点不回这项时为 0（= 未知，不代表没命中）。
+    pub cache_read_tokens: u32,
+    /// 写入 prompt 缓存的 token 数（Anthropic 的
+    /// `cache_creation_input_tokens`）。首轮建缓存时才有；OpenAI 系不回。
+    pub cache_write_tokens: u32,
 }
 
 /// 工具描述（请求侧）。字段对齐 OpenAI `tools[].function` 与 Anthropic
@@ -537,6 +572,10 @@ pub(crate) struct OpenAiChatRequest {
     /// "tokens: +0 in / +0 out"，token 与成本完全不可见。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stream_options: Option<OpenAiStreamOptions>,
+    /// 缓存亲和键（自动前缀缓存的路由键，非缓存边界声明）。
+    /// 见 [`crate::params::GenerateParams::prompt_cache_key`]。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// `stream_options` 载荷（仅流式请求携带）。
@@ -695,6 +734,30 @@ pub(crate) enum OpenAiResponseContentPart {
 pub(crate) struct OpenAiUsage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    /// OpenAI 官方形状：`prompt_tokens_details: { cached_tokens }`。
+    #[serde(default)]
+    pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    /// DeepSeek 的平铺形状（不套 details）。两个都收，取非零者。
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct OpenAiPromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+impl OpenAiUsage {
+    /// 归一后的缓存命中 token 数（端点没回则 0）。
+    pub fn cached_tokens(&self) -> u32 {
+        self.prompt_tokens_details
+            .as_ref()
+            .and_then(|d| d.cached_tokens)
+            .filter(|v| *v > 0)
+            .or(self.prompt_cache_hit_tokens)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Deserialize)]
@@ -882,6 +945,10 @@ pub(crate) struct AnthropicResponse {
 pub(crate) struct AnthropicUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]

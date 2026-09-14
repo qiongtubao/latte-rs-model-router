@@ -39,6 +39,7 @@ async fn main() -> Result<()> {
         omit_max_tokens: false,
         max_tokens_field: Default::default(),
         prompt_cache: false,
+        prompt_cache_key: None,
         supports_thinking: false,
         supports_vision: false,
         cost_per_million_input: 0.0,

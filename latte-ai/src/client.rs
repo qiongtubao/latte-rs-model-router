@@ -25,12 +25,149 @@ fn debug_http_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// 修复 `messages` 里 `tool_calls` ↔ `Role::Tool` 结果的配对缺口，
+/// 发给 provider 前的最后一道保险。
+///
+/// **为什么需要**：部分严格校验的 OpenAI-compatible 端点（实测 MiniMax-M3）
+/// 会对配对不上的 tool_call/tool_result 直接 400（`invalid params, tool
+/// call result does no[t match]...`），Anthropic 对孤儿 `tool_result` 块同样
+/// 拒绝。孤儿产生的典型场景：一轮里模型发了多个 tool_call，其中几个被工具
+/// 校验直接拒绝（如 `code_graph` 参数错误）、引擎中止了本轮剩余调用，或者
+/// 某次模型调用整体失败被重试——历史里就会留下"assistant 说要调 A/B/C，
+/// 但只有 A 有结果"这种缺口，一旦这段历史被重放，配对校验严格的端点直接
+/// 拒绝整个请求，比原始错误更难自愈（模型再也看不到自己请求过什么）。
+///
+/// 做法照抄 oh-my-pi (`repairOrphanResponsesToolOutputs` /
+/// `repairOrphanResponsesToolCalls`, `openai-shared.ts`) 与 opencode
+/// (`message-v2.ts` 的 dangling tool_use 防护) 共同验证过的两步：
+/// 1. 孤儿 `Role::Tool` 结果（`tool_call_id` 找不到前面对应的
+///    `Assistant.tool_calls` 项）→ 折叠成一条 `Assistant` 文本note，
+///    保留内容但脱离协议要求的配对形状。
+/// 2. 孤儿 `tool_calls` 项（assistant 请求调用，但后面从未出现匹配的
+///    `Role::Tool` 结果）→ 补一条占位结果，让模型知道这次调用被中断，
+///    而不是径直丢弃（丢弃会让模型"以为自己没发过这个调用"）。
+///
+/// 健康路径（绝大多数请求）零分配：没有缺口时原样借用返回。
+fn repair_tool_call_pairs(messages: &[Message]) -> std::borrow::Cow<'_, [Message]> {
+    // 第一步先看看到底有没有缺口，健康路径直接借用返回。
+    let mut called_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut resulted_ids: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for m in messages {
+        if let Some(calls) = &m.tool_calls {
+            for c in calls {
+                called_ids.insert(c.id.as_str());
+            }
+        }
+        if m.role == Role::Tool {
+            if let Some(id) = &m.tool_call_id {
+                resulted_ids.insert(id.as_str());
+            }
+        }
+    }
+    let has_orphan_result = messages.iter().any(|m| {
+        m.role == Role::Tool
+            && m.tool_call_id
+                .as_deref()
+                .map(|id| !called_ids.contains(id))
+                .unwrap_or(true)
+    });
+    let has_orphan_call = called_ids.iter().any(|id| !resulted_ids.contains(id));
+    if !has_orphan_result && !has_orphan_call {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+
+    // 第二步：真的有缺口，逐条重建。
+    // 2a. 记录每个 tool_call id 后面是否真的跟了一条 Role::Tool 结果——
+    //     用于第二遍决定要不要在 assistant 消息后面插占位结果。
+    let mut seen_call_before: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len());
+    for m in messages {
+        if m.role == Role::Tool {
+            let is_orphan = m
+                .tool_call_id
+                .as_deref()
+                .map(|id| !seen_call_before.contains(id))
+                .unwrap_or(true);
+            if is_orphan {
+                // 孤儿结果：折叠成 assistant 文本，call_id 保留在文案里
+                // 方便排查，但不再以 Role::Tool 形状出现。
+                let body = m
+                    .content
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let call_id = m.tool_call_id.clone().unwrap_or_default();
+                out.push(Message::assistant(format!(
+                    "[孤儿工具结果 call_id={call_id}]：{body}"
+                )));
+                continue;
+            }
+        } else if let Some(calls) = &m.tool_calls {
+            for c in calls {
+                seen_call_before.insert(c.id.clone());
+            }
+        }
+        out.push(m.clone());
+    }
+
+    // 2b. 第三遍：对每个 Assistant.tool_calls 项，若整个 `out` 里都没有
+    //     配对结果，在该 assistant 消息后面插一条占位 Role::Tool 结果。
+    let mut fully_resulted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for m in &out {
+        if m.role == Role::Tool {
+            if let Some(id) = &m.tool_call_id {
+                fully_resulted.insert(id.clone());
+            }
+        }
+    }
+    let mut final_out: Vec<Message> = Vec::with_capacity(out.len());
+    for m in out {
+        let pending_calls: Vec<String> = m
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter(|c| !fully_resulted.contains(c.id.as_str()))
+                    .map(|c| c.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        final_out.push(m);
+        for id in pending_calls {
+            final_out.push(Message::tool_result(
+                id,
+                "[工具调用被中断，未产出结果：本轮执行未完成或已被引擎中止。]",
+            ));
+        }
+    }
+    std::borrow::Cow::Owned(final_out)
+}
+
 /// 流式请求是否带 `stream_options: {include_usage: true}`。默认开——
 /// 不带它 OpenAI 兼容端点不回 usage，token 记账全 0（见
 /// [`OpenAiChatRequest::stream_options`]）。个别端点对未知字段 400，
 /// 用 `LATTE_AI_STREAM_INCLUDE_USAGE=0` 关掉。
 fn stream_include_usage() -> bool {
     std::env::var("LATTE_AI_STREAM_INCLUDE_USAGE")
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true)
+}
+
+/// 是否下发顶层 `prompt_cache_key`（缓存亲和键）的**全局**默认。
+///
+/// 默认开：它是 OpenAI 官方文档化的 chat completions 参数，绝大多数兼容
+/// 端点会忽略不认识的顶层字段；而不下发的代价是自动前缀缓存可能因为网关
+/// 把请求路由到别的机器而彻底不命中（实测 jemalloc 会话：22.19M 输入
+/// token 零缓存命中）。个别严格端点用
+/// `LATTE_AI_PROMPT_CACHE_KEY=0` 关掉；单个模型用
+/// `Model::prompt_cache_key = Some(false)` 关。
+fn prompt_cache_key_default_enabled() -> bool {
+    std::env::var("LATTE_AI_PROMPT_CACHE_KEY")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true)
 }
@@ -406,6 +543,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                 input_tokens: data.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
                 output_tokens: data.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
                 thinking_tokens: 0,
+                cache_read_tokens: data.usage.as_ref().map(|u| u.cached_tokens()).unwrap_or(0),
+                cache_write_tokens: 0,
             },
         })
     }
@@ -485,6 +624,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                                     input_tokens: u.prompt_tokens,
                                     output_tokens: u.completion_tokens,
                                     thinking_tokens: 0,
+                                    cache_read_tokens: u.cached_tokens(),
+                                    cache_write_tokens: 0,
                                 }).unwrap_or_default();
                                 tx.send(StreamEvent::Delta { content: content.clone(), usage: Some(usage.clone()) }).await.ok();
                                 tx.send(StreamEvent::Done { content, tool_calls: vec![], usage, stop_reason: String::new() }).await.ok();
@@ -537,6 +678,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                                         input_tokens: u.prompt_tokens,
                                         output_tokens: u.completion_tokens,
                                         thinking_tokens: 0,
+                                        cache_read_tokens: u.cached_tokens(),
+                                        cache_write_tokens: 0,
                                     }).unwrap_or_default();
                                     tx.send(StreamEvent::Delta { content: content.clone(), usage: Some(u.clone()) }).await.ok();
                                     tx.send(StreamEvent::Done { content, tool_calls: vec![], usage: u, stop_reason: String::new() }).await.ok();
@@ -583,6 +726,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                                                 input_tokens: u.prompt_tokens,
                                                 output_tokens: u.completion_tokens,
                                                 thinking_tokens: 0,
+                                                cache_read_tokens: u.cached_tokens(),
+                                                cache_write_tokens: 0,
                                             };
                                         }
                                     }
@@ -634,6 +779,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                         input_tokens: data.usage.as_ref().map(|u| u.prompt_tokens).unwrap_or(0),
                         output_tokens: data.usage.as_ref().map(|u| u.completion_tokens).unwrap_or(0),
                         thinking_tokens: 0,
+                        cache_read_tokens: data.usage.as_ref().map(|u| u.cached_tokens()).unwrap_or(0),
+                        cache_write_tokens: 0,
                     };
                     if let Some(choice) = data.choices.into_iter().next() {
                         let (parts, tool_calls) = extract_openai_response(
@@ -713,6 +860,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                 input_tokens: data.usage.input_tokens,
                 output_tokens: data.usage.output_tokens,
                 thinking_tokens: 0,
+                cache_read_tokens: data.usage.cache_read_input_tokens.unwrap_or(0),
+                cache_write_tokens: data.usage.cache_creation_input_tokens.unwrap_or(0),
             },
         })
     }
@@ -802,6 +951,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
                                                 input_tokens: u.input_tokens,
                                                 output_tokens: u.output_tokens,
                                                 thinking_tokens: 0,
+                                                cache_read_tokens: u.cache_read_input_tokens.unwrap_or(0),
+                                                cache_write_tokens: u.cache_creation_input_tokens.unwrap_or(0),
                                             };
                                         }
                                     }
@@ -865,6 +1016,8 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
         params: &GenerateParams,
         stream: bool,
     ) -> OpenAiChatRequest {
+        let repaired = repair_tool_call_pairs(messages);
+        let messages: &[Message] = &repaired;
         // 输出上限只在这一处决策，随后按 `max_tokens_field` 落到两个互斥
         // 字段之一（`None` 时两个都省略，交给厂商默认值）。
         let cap = Self::effective_max_tokens(params.max_tokens, &self.model);
@@ -974,6 +1127,14 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
             } else {
                 None
             },
+            // 缓存亲和键：只有调用方真的给了 key、且该模型/全局没关掉时才
+            // 下发。没接线的调用路径（key 为 None）请求体逐字节不变。
+            prompt_cache_key: params
+                .prompt_cache_key
+                .as_ref()
+                .filter(|k| !k.trim().is_empty())
+                .filter(|_| self.prompt_cache_key_enabled())
+                .cloned(),
         };
 
         // OpenAI-compatible 路径的 prompt caching：**按模型开关**下发。
@@ -985,12 +1146,22 @@ fn completion_from_event(event: StreamEvent) -> Option<Result<Completion>> {
         req
     }
 
+    /// 本次请求是否下发 `prompt_cache_key`：模型级显式声明优先，
+    /// 否则跟随全局默认。
+    fn prompt_cache_key_enabled(&self) -> bool {
+        self.model
+            .prompt_cache_key
+            .unwrap_or_else(prompt_cache_key_default_enabled)
+    }
+
     fn build_anthropic_request(
         &self,
         messages: &[Message],
         params: &GenerateParams,
         _stream: bool,
     ) -> AnthropicRequest {
+        let repaired = repair_tool_call_pairs(messages);
+        let messages: &[Message] = &repaired;
         // Anthropic 要求 `max_tokens` 必填，所以这条路必须给出一个数：
         // 走同一个 `effective_max_tokens` 拿到天花板与钳位，`None`（含
         // `omit_max_tokens = true` 的情况）时用窗口推出的上限兜底。
@@ -1291,6 +1462,112 @@ fn build_stream_tool_calls(acc: &[ToolCallAccum]) -> Vec<ToolCall> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    fn call(id: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: "code_graph".into(),
+            arguments: serde_json::json!({}),
+            arguments_raw: None,
+            arguments_parse_error: None,
+        }
+    }
+
+    #[test]
+    fn repair_is_noop_on_healthy_history() {
+        let msgs = vec![
+            Message::user("找一下 decay 相关函数"),
+            Message::assistant_with_tool_calls("", vec![call("c1")]),
+            Message::tool_result("c1", "ok"),
+            Message::assistant("找到了"),
+        ];
+        let out = repair_tool_call_pairs(&msgs);
+        // 健康路径必须零拷贝借用，不能是 Owned。
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn repair_folds_orphan_tool_result_into_assistant_note() {
+        // Role::Tool 结果的 tool_call_id 找不到任何前置 tool_call。
+        let msgs = vec![
+            Message::user("go"),
+            Message::tool_result("ghost", "some stale result"),
+            Message::assistant("done"),
+        ];
+        let out = repair_tool_call_pairs(&msgs);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        // 孤儿结果不再以 Role::Tool 形状出现。
+        assert!(out.iter().all(|m| m.role != Role::Tool));
+        // 内容被保留（折叠进某条 assistant 文本）。
+        let folded = out
+            .iter()
+            .find(|m| {
+                m.role == Role::Assistant
+                    && m.content.iter().any(|p| matches!(p, ContentPart::Text { text } if text.contains("some stale result")))
+            });
+        assert!(folded.is_some(), "孤儿结果内容应保留在某条 assistant 消息里");
+    }
+
+    #[test]
+    fn repair_injects_placeholder_for_orphan_tool_call() {
+        // assistant 请求了 c1/c2，但只有 c1 有结果——c2 是这次 jemalloc
+        // 事故的真实形状：一轮 5 个 code_graph 调用全部校验失败，
+        // 历史里只留下 assistant.tool_calls，没有任何 Role::Tool 跟着。
+        let msgs = vec![
+            Message::user("go"),
+            Message::assistant_with_tool_calls("", vec![call("c1"), call("c2")]),
+            Message::tool_result("c1", "ok"),
+        ];
+        let out = repair_tool_call_pairs(&msgs);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        // c1 结果原样保留、且只出现一次（不能被误当孤儿再折叠一次）。
+        let c1_results: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c1"))
+            .collect();
+        assert_eq!(c1_results.len(), 1);
+        // c2 补了占位结果。
+        let c2_results: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c2"))
+            .collect();
+        assert_eq!(c2_results.len(), 1, "孤儿 tool_call 应补一条占位结果");
+        // 每个 assistant.tool_calls 项现在都有配对结果——校验严格的
+        // provider（MiniMax-M3 / Azure strict pairing）不会再 400。
+        let called_ids: std::collections::HashSet<&str> = out
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flat_map(|calls| calls.iter().map(|c| c.id.as_str()))
+            .collect();
+        let resulted_ids: std::collections::HashSet<&str> = out
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        assert!(called_ids.is_subset(&resulted_ids));
+    }
+
+    #[test]
+    fn repair_handles_orphan_result_and_orphan_call_together() {
+        let msgs = vec![
+            Message::tool_result("ghost", "stale"),
+            Message::assistant_with_tool_calls("", vec![call("c1")]),
+            // c1 从未获得结果——直接接了下一条 user 消息（对应"引擎中止
+            // 本轮剩余调用"的真实场景）。
+            Message::user("换个思路"),
+        ];
+        let out = repair_tool_call_pairs(&msgs);
+        assert!(matches!(out, std::borrow::Cow::Owned(_)));
+        assert!(out.iter().all(|m| m.tool_call_id.as_deref() != Some("ghost")));
+        let c1_results: Vec<_> = out
+            .iter()
+            .filter(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("c1"))
+            .collect();
+        assert_eq!(c1_results.len(), 1, "c1 应补占位结果");
+    }
+
     /// 模型目录里的 `timeout_secs` 必须**精确生效**，既能放宽也能收紧。
     ///
     /// 原来是 `base.max(t)`：只能放宽。想给已知会秒回的模型配
@@ -1345,6 +1622,7 @@ mod tests {
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
         prompt_cache: false,
+        prompt_cache_key: None,
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,
@@ -1436,16 +1714,31 @@ mod tests {
     fn openai_request_role_tool_serializes_as_string_content() {
         // Role::Tool 的 content 必须是 string（OpenAI 协议要求），不是
         // 数组。`OpenAiMessageContent` 的 untagged 序列化自动选 ToolString 变体。
+        //
+        // 带一条匹配的 assistant tool_call——否则这条裸 tool_result 会被
+        // `repair_tool_call_pairs`（发送前的孤儿配对修复）判定为孤儿并
+        // 折叠成 assistant 文本，这是该修复故意的正确行为，不是本测试
+        // 要验证的东西；本测试只关心"配对健全时 wire 序列化形状对不对"。
         let client = AiClient::new(model_with_key(ApiType::OpenAiCompletions, "sk-test")).unwrap();
         let params = GenerateParams::default();
         let msgs = vec![
             Message::user("北京天气?"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "call_abc".into(),
+                    name: "weather".into(),
+                    arguments: serde_json::json!({}),
+                    arguments_raw: None,
+                    arguments_parse_error: None,
+                }],
+            ),
             Message::tool_result("call_abc", "晴，25°C"),
         ];
         let req = client.build_openai_request(&msgs, &params, false);
         let j = serde_json::to_value(&req).unwrap();
         // tool 消息的 content 是 string，不是 array
-        let tool_msg = &j["messages"][1];
+        let tool_msg = &j["messages"][2];
         assert_eq!(tool_msg["role"], "tool");
         assert_eq!(tool_msg["content"], "晴，25°C");
         assert_eq!(tool_msg["tool_call_id"], "call_abc");
@@ -1540,23 +1833,37 @@ mod tests {
     fn anthropic_request_role_tool_becomes_tool_result_block() {
         // Anthropic 没有 tool role —— Role::Tool 转成 user role 消息
         // + 一个 tool_result content block。这是关键路径。
+        //
+        // 带一条匹配的 assistant tool_call——理由同 OpenAI 版本：裸
+        // tool_result 会被发送前的孤儿配对修复折叠掉，这里要测的是
+        // 配对健全时的序列化形状。
         let client = AiClient::new(model_with_key(ApiType::AnthropicMessages, "sk-test")).unwrap();
         let params = GenerateParams::default();
         let msgs = vec![
             Message::user("北京天气?"),
+            Message::assistant_with_tool_calls(
+                "",
+                vec![ToolCall {
+                    id: "toolu_abc".into(),
+                    name: "weather".into(),
+                    arguments: serde_json::json!({}),
+                    arguments_raw: None,
+                    arguments_parse_error: None,
+                }],
+            ),
             Message::tool_result("toolu_abc", "晴，25°C"),
         ];
         let req = client.build_anthropic_request(&msgs, &params, false);
         let j = serde_json::to_value(&req).unwrap();
-        // 第二条消息的 role 必须是 user（Anthropic 协议没有 tool role）
-        let second = &j["messages"][1];
-        assert_eq!(second["role"], "user");
+        // 第三条消息的 role 必须是 user（Anthropic 协议没有 tool role）
+        let third = &j["messages"][2];
+        assert_eq!(third["role"], "user");
         // content 是一个 tool_result block，不是 text
-        assert_eq!(second["content"][0]["type"], "tool_result");
-        assert_eq!(second["content"][0]["tool_use_id"], "toolu_abc");
-        assert_eq!(second["content"][0]["content"], "晴，25°C");
+        assert_eq!(third["content"][0]["type"], "tool_result");
+        assert_eq!(third["content"][0]["tool_use_id"], "toolu_abc");
+        assert_eq!(third["content"][0]["content"], "晴，25°C");
         // is_error 没显式设 → 跳过
-        assert!(second["content"][0].get("is_error").is_none());
+        assert!(third["content"][0].get("is_error").is_none());
     }
 
     #[test]
@@ -1665,6 +1972,133 @@ mod tests {
         assert!(j.get("tools").is_none() || j["tools"].as_array().map(|a| a.is_empty()).unwrap_or(true));
         // 唯一那条消息仍应拿到一个尾部断点。
         assert_eq!(j["messages"][0]["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    /// 缓存命中数必须从 usage 解析出来——三家字段名不同，都要认。
+    ///
+    /// 没有这一项时「配了 caching」与「caching 真生效」无从区分：实测
+    /// jemalloc 会话零命中却毫无迹象。对齐 oh-my-pi 从 usage 读
+    /// `cacheReadTokens` 做观测的做法。
+    #[test]
+    fn cache_hit_tokens_are_parsed_from_all_provider_shapes() {
+        use crate::models::{AnthropicUsage, OpenAiUsage};
+
+        // OpenAI 官方：prompt_tokens_details.cached_tokens
+        let u: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"completion_tokens":10,
+                "prompt_tokens_details":{"cached_tokens":896}}"#,
+        )
+        .expect("parse");
+        assert_eq!(u.cached_tokens(), 896);
+
+        // DeepSeek：平铺 prompt_cache_hit_tokens
+        let u: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1000,"completion_tokens":10,"prompt_cache_hit_tokens":768}"#,
+        )
+        .expect("parse");
+        assert_eq!(u.cached_tokens(), 768);
+
+        // 端点没回这项 → 0（表示未知，不代表没命中）
+        let u: OpenAiUsage =
+            serde_json::from_str(r#"{"prompt_tokens":1000,"completion_tokens":10}"#)
+                .expect("parse");
+        assert_eq!(u.cached_tokens(), 0);
+
+        // details 存在但 cached_tokens 为 0 时回落到平铺字段
+        let u: OpenAiUsage = serde_json::from_str(
+            r#"{"prompt_tokens":1,"completion_tokens":1,
+                "prompt_tokens_details":{"cached_tokens":0},
+                "prompt_cache_hit_tokens":64}"#,
+        )
+        .expect("parse");
+        assert_eq!(u.cached_tokens(), 64);
+
+        // Anthropic：读/写分开
+        let a: AnthropicUsage = serde_json::from_str(
+            r#"{"input_tokens":50,"output_tokens":5,
+                "cache_read_input_tokens":900,"cache_creation_input_tokens":120}"#,
+        )
+        .expect("parse");
+        assert_eq!(a.cache_read_input_tokens, Some(900));
+        assert_eq!(a.cache_creation_input_tokens, Some(120));
+    }
+
+    /// 缓存亲和键 `prompt_cache_key`：只有调用方给了 key 才下发。
+    ///
+    /// 动机（实测 jemalloc 2026-09-10 会话）：三个模型全是 `api = "openai"`
+    /// 且都没开 `prompt_cache`，22.19M 输入 token **零缓存命中**。显式断点
+    /// 因兼容风险默认关是对的，但当时**完全没有**自动缓存这条路——而命中
+    /// 自动前缀缓存需要请求被路由到持有 KV cache 的那台机器，这个键就是
+    /// 干这个的（对齐 oh-my-pi 的 `supportsPromptCacheKey`）。
+    #[test]
+    fn prompt_cache_key_is_sent_only_when_caller_supplies_one() {
+        let model = model_with_key(ApiType::OpenAiCompletions, "k");
+        let client = AiClient::new(model).expect("client");
+        let msgs = vec![Message::user("hi")];
+
+        // 没给 key → 字段不出现（老调用路径请求体逐字节不变）
+        let req = client.build_openai_request(&msgs, &GenerateParams::default(), false);
+        assert!(req.prompt_cache_key.is_none(), "未给 key 不该下发");
+        let body = serde_json::to_value(&req).expect("serialize");
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "字段必须整个缺席，不能是 null: {body}"
+        );
+
+        // 给了 key → 落到请求体顶层
+        let params = GenerateParams {
+            prompt_cache_key: Some("session-abc".into()),
+            ..GenerateParams::default()
+        };
+        let req = client.build_openai_request(&msgs, &params, false);
+        assert_eq!(req.prompt_cache_key.as_deref(), Some("session-abc"));
+        let body = serde_json::to_value(&req).expect("serialize");
+        assert_eq!(body["prompt_cache_key"], "session-abc");
+
+        // 全是空白的 key 视为没给（避免下发一个无意义的路由键）
+        let params = GenerateParams {
+            prompt_cache_key: Some("   ".into()),
+            ..GenerateParams::default()
+        };
+        let req = client.build_openai_request(&msgs, &params, false);
+        assert!(req.prompt_cache_key.is_none(), "空白 key 应视为未给");
+    }
+
+    /// 模型级 `prompt_cache_key = Some(false)` 能给严格端点关掉。
+    #[test]
+    fn prompt_cache_key_can_be_disabled_per_model() {
+        let mut model = model_with_key(ApiType::OpenAiCompletions, "k");
+        model.prompt_cache_key = Some(false);
+        let client = AiClient::new(model).expect("client");
+        let params = GenerateParams {
+            prompt_cache_key: Some("session-abc".into()),
+            ..GenerateParams::default()
+        };
+        let req = client.build_openai_request(&[Message::user("hi")], &params, false);
+        assert!(
+            req.prompt_cache_key.is_none(),
+            "模型声明关掉时即便给了 key 也不下发"
+        );
+    }
+
+    /// 亲和键与显式断点是**两条独立**机制：只开亲和键时不该冒出
+    /// `cache_control`（那个字段才是 400 的风险源）。
+    #[test]
+    fn cache_key_does_not_imply_explicit_breakpoints() {
+        let model = model_with_key(ApiType::OpenAiCompletions, "k");
+        assert!(!model.prompt_cache, "前提：显式断点默认关");
+        let client = AiClient::new(model).expect("client");
+        let params = GenerateParams {
+            prompt_cache_key: Some("s1".into()),
+            tools: vec![],
+            ..GenerateParams::default()
+        };
+        let req = client.build_openai_request(&[Message::user("hi")], &params, false);
+        let body = serde_json::to_string(&req).expect("serialize");
+        assert!(
+            !body.contains("cache_control"),
+            "只给亲和键时不该注入 Anthropic 式断点: {body}"
+        );
     }
 
     /// OpenAI-compatible 路径：`prompt_cache` **关**（默认）时一个断点都
@@ -1818,6 +2252,7 @@ mod tests {
             omit_max_tokens: false,
             max_tokens_field: Default::default(),
         prompt_cache: false,
+        prompt_cache_key: None,
             supports_thinking: false,
             supports_vision: false,
             cost_per_million_input: 0.0,

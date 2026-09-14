@@ -69,6 +69,29 @@ pub struct GenerateParams {
     /// Anthropic 路径上不下发。
     #[serde(default)]
     pub parallel_tool_calls: Option<bool>,
+
+    /// **缓存亲和键**：OpenAI 协议的顶层 `prompt_cache_key`。
+    ///
+    /// 与 [`crate::models::Model::prompt_cache`]（Anthropic 式**显式断点**）
+    /// 是两条独立的机制：
+    ///
+    /// - 显式断点告诉供应商「从这里开始缓存」，需要端点认 `cache_control`，
+    ///   不认的会 400，所以默认关；
+    /// - `prompt_cache_key` 走的是供应商的**自动前缀缓存**，它不声明缓存
+    ///   边界，只声明「这些请求属于同一个会话」。
+    ///
+    /// 为什么单靠字节稳定的前缀不够：命中自动缓存要求请求落到**持有那份
+    /// KV cache 的那台机器**上，而网关的负载均衡不保证这一点。这个键就是
+    /// 给供应商用来做路由亲和的。
+    ///
+    /// 对齐 oh-my-pi 的 `supportsPromptCacheKey` + `prompt_cache_key`
+    /// （`packages/ai/src/providers/openai-completions.ts`）——它为此专门有
+    /// 一组 cache-affinity 测试。
+    ///
+    /// `None`（默认）→ 字段不下发，行为与从前逐字节一致。调用方应传一个
+    /// **整个会话内稳定**的值（通常是 session id）。
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
 }
 
 /// Thinking/reasoning budget levels.
@@ -113,6 +136,7 @@ impl GenerateParams {
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
             parallel_tool_calls: None,
+            prompt_cache_key: None,
         }
     }
 
@@ -133,6 +157,7 @@ impl GenerateParams {
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
             parallel_tool_calls: None,
+            prompt_cache_key: None,
         }
     }
 
@@ -153,6 +178,7 @@ impl GenerateParams {
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
             parallel_tool_calls: None,
+            prompt_cache_key: None,
         }
     }
 
@@ -211,6 +237,7 @@ impl Default for GenerateParams {
             tools: vec![],
             tool_choice: crate::models::ToolChoice::Auto,
             parallel_tool_calls: None,
+            prompt_cache_key: None,
         }
     }
 }
